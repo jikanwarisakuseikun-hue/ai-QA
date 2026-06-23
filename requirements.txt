@@ -2,4 +2,3 @@ streamlit
 streamlit-gsheets
 gTTS
 google-generativeai
-requests
