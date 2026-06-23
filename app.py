@@ -5,10 +5,16 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # =============================================================================
-# 1. 初期設定 & 認証情報の一括読み込み
+# 1. 画面の初期設定
 # =============================================================================
 st.set_page_config(page_title="AI English QA Test", layout="centered")
 
+st.title("🤖 AI English Performance Test")
+st.write("画面の指示に従って、英語の質問に口頭で答えてください。")
+
+# =============================================================================
+# 2. Secretsの徹底チェック (エラーを画面に日本語で出すための処理)
+# =============================================================================
 try:
     # Azure OpenAI 設定の取得
     AZURE_API_KEY = st.secrets["AZURE_OPENAI_API_KEY"]
@@ -19,29 +25,47 @@ try:
     DEPLOY_WHISPER = st.secrets["AZURE_DEPLOYMENT_WHISPER"]
     DEPLOY_TTS = st.secrets["AZURE_DEPLOYMENT_TTS"]
     
-    # Google スプレッドシート設定の取得
-    SPREADSHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
+    # Google スプレッドシート設定の有無を個別チェック
+    if "connections" not in st.secrets or "gsheets" not in st.secrets["connections"]:
+        st.error("❌ Secretsの中に `[connections.gsheets]` というグループ名が見つかりません。設定ファイルの一番下に正しく書かれているか確認してください。")
+        st.stop()
+        
+    gsheets_secrets = st.secrets["connections"]["gsheets"]
     
-    # サービスアカウント辞書をSecretsから直接組み立て（PermissionError対策）
+    # 必須項目のチェックリスト
+    required_keys = ["spreadsheet", "type", "project_id", "private_key_id", "private_key", "client_email", "client_id", "client_x509_cert_url"]
+    missing_keys = [k for k in required_keys if k not in gsheets_secrets]
+    
+    if missing_keys:
+        st.error(f"❌ Secretsの `[connections.gsheets]` の中に、以下の項目が足りないか、スペルが間違っています：\n\n**{missing_keys}**")
+        st.stop()
+        
+    # URLの取得
+    SPREADSHEET_URL = gsheets_secrets["spreadsheet"]
+    
+    # サービスアカウント辞書を安全に組み立て
     creds_dict = {
-        "type": st.secrets["connections"]["gsheets"]["type"],
-        "project_id": st.secrets["connections"]["gsheets"]["project_id"],
-        "private_key_id": st.secrets["connections"]["gsheets"]["private_key_id"],
-        "private_key": st.secrets["connections"]["gsheets"]["private_key"],
-        "client_email": st.secrets["connections"]["gsheets"]["client_email"],
-        "client_id": st.secrets["connections"]["gsheets"]["client_id"],
+        "type": gsheets_secrets["type"],
+        "project_id": gsheets_secrets["project_id"],
+        "private_key_id": gsheets_secrets["private_key_id"],
+        "private_key": gsheets_secrets["private_key"],
+        "client_email": gsheets_secrets["client_email"],
+        "client_id": gsheets_secrets["client_id"],
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
         "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_x509_cert_url": st.secrets["connections"]["gsheets"]["client_x509_cert_url"],
+        "client_x509_cert_url": gsheets_secrets["client_x509_cert_url"],
         "universe_domain": "googleapis.com"
     }
+except KeyError as ke:
+    st.error(f"❌ AzureまたはGoogleの設定項目が見つかりません。名前が間違っている可能性があります: **{ke}**")
+    st.stop()
 except Exception as e:
-    st.error("⚠️ StreamlitのSecrets（設定情報）が正しく読み込めませんでした。設定を見直してください。")
+    st.error(f"❌ Secretsの読み込み段階で予期せぬエラーが発生しました: {e}")
     st.stop()
 
 # =============================================================================
-# 2. クライアントの初期化
+# 3. 各種クライアントの初期化 & 接続テスト
 # =============================================================================
 # Azure OpenAI クライアント
 ai_client = AzureOpenAI(
@@ -64,11 +88,17 @@ try:
     gc = get_gspread_client()
     workbook = gc.open_by_url(SPREADSHEET_URL)
 except Exception as e:
-    st.error(f"❌ Googleスプレッドシートへのアクセスに失敗しました。権限やURLを確認してください。\nエラー詳細: {e}")
+    st.error("❌ Googleスプレッドシートへのログイン・アクセスに失敗しました。以下の原因が考えられます。")
+    st.info(f"**【エラーの生データ】**\n`{str(e)}`")
+    st.markdown("""
+    1. **スプレッドシートの共有設定漏れ**：スプレッドシートの「共有」で、一般的なアクセスを「リンクを知っている全員（編集者）」にするか、サービスアカウントのメールアドレスを追加してください。
+    2. **URLの間違い**：Secretsに書いた `spreadsheet` のURLが正しいか確認してください。
+    3. **Private Keyの破損**：鍵のコピーに失敗している、または改行コードが壊れている可能性があります。
+    """)
     st.stop()
 
 # =============================================================================
-# 3. データ読み込み関数
+# 4. データ読み込み・書き込み関数
 # =============================================================================
 def load_config_data():
     """Configシートから問題データを取得"""
@@ -77,24 +107,20 @@ def load_config_data():
         records = sheet.get_all_records()
         return records
     except Exception as e:
-        st.error(f"「Config」シートの読み込みに失敗しました。シート名を確認してください。: {e}")
+        st.error(f"⚠️ スプレッドシートの中に **「Config」** という名前のシート（タブ）が見つかりません。シート名を確認してください。詳細: {e}")
         return []
 
 def save_result_to_sheets(student_name, student_class, question_no, question_text, transcript, score, feedback):
     """Resultシートに結果を保存"""
     try:
         sheet = workbook.worksheet("Result")
-        # データの追加 (名前, クラス, 問題番号, 問題内容, 生徒の回答, 点数, フィードバック)
         sheet.append_row([student_name, student_class, question_no, question_text, transcript, score, feedback])
     except Exception as e:
-        st.error(f"「Result」シートへの保存に失敗しました: {e}")
+        st.error(f"⚠️ **「Result」** という名前のシート（タブ）が見つからないため、保存に失敗しました: {e}")
 
 # =============================================================================
-# 4. Streamlit メインUI画面
+# 5. アプリケーション進行ロジック
 # =============================================================================
-st.title("🤖 AI English Performance Test")
-st.write("画面の指示に従って、英語の質問に口頭で答えてください。")
-
 # アプリの状態管理（セッション）
 if "step" not in st.session_state:
     st.session_state.step = "login"
@@ -122,7 +148,7 @@ if st.session_state.step == "login":
 # --- ステップ2: テスト本番画面 ---
 elif st.session_state.step == "test":
     if not questions:
-        st.error("テスト問題（Configシート）が空っぽ、または読み込めません。")
+        st.error("テスト問題（Configシート）からデータが読み込めないため、テストを開始できません。")
         st.stop()
         
     q_idx = st.session_state.current_q
@@ -130,10 +156,9 @@ elif st.session_state.step == "test":
     
     st.subheader(f"🗣️ Question {q_idx + 1} / {len(questions)}")
     
-    # 1. AIの音声質問を生成・再生
+    # AIの音声質問を生成・再生
     q_text = current_question.get("QuestionText", "Hello, please introduce yourself.")
     
-    # 音声のキャッシュ化（何度も生成して課金されるのを防ぐ）
     audio_key = f"audio_q_{q_idx}"
     if audio_key not in st.session_state:
         with st.spinner("AIが質問を準備中..."):
@@ -147,7 +172,7 @@ elif st.session_state.step == "test":
     st.audio(st.session_state[audio_key], format="audio/mp3")
     st.caption("上記の再生ボタンを押して、AIの質問を聴いてください。")
     
-    # 2. 生徒の音声録音フォーム
+    # 生徒の音声録音フォーム
     st.write("---")
     st.write("🎙️ **ここに英語で答えてください：**")
     audio_file = st.audio_input("マイクボタンを押して録音を開始し、話し終わったらもう一度押して停止してください。")
@@ -157,9 +182,7 @@ elif st.session_state.step == "test":
             with st.spinner("AIがあなたの英語を採点中... 10秒ほどお待ちください。"):
                 try:
                     # ① Whisperで文字起こし
-                    # st.audio_input から得られるBytesIOデータを直接送るための成形
                     audio_data = audio_file.read()
-                    # テンポラリファイルに一時保存
                     with open("temp_reply.wav", "wb") as f:
                         f.write(audio_data)
                         
@@ -193,7 +216,6 @@ elif st.session_state.step == "test":
                     )
                     gpt_output = chat_res.choices[0].message.content
                     
-                    # GPTの出力から点数とフィードバックを抽出
                     score = "未採点"
                     feedback = gpt_output
                     for line in gpt_output.split("\n"):
@@ -213,11 +235,10 @@ elif st.session_state.step == "test":
                         feedback
                     )
                     
-                    # 一時ファイルの削除
                     if os.path.exists("temp_reply.wav"):
                         os.remove("temp_reply.wav")
                     
-                    # ④ 次の問題に進むか、終了するか
+                    # ④ 進行管理
                     if q_idx + 1 < len(questions):
                         st.session_state.current_q += 1
                         st.success("回答を記録しました！次の問題に進みます。")
@@ -227,7 +248,7 @@ elif st.session_state.step == "test":
                         st.rerun()
                         
                 except Exception as eval_err:
-                    st.error(f"採点処理中にエラーが発生しました。もう一度お試しください。: {eval_err}")
+                    st.error(f"採点処理中にエラーが発生しました。もう一度お試しください。詳細: {eval_err}")
 
 # --- ステップ3: テスト終了画面 ---
 elif st.session_state.step == "finish":
