@@ -3,6 +3,7 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import datetime
 import io
+import requests
 from openai import AzureOpenAI
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -20,22 +21,15 @@ if "student_info" not in st.session_state:
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
 
-# エンドポイントの末尾を綺麗に整形
+# エンドポイントとキーの基本情報
 base_endpoint = st.secrets["AZURE_OPENAI_ENDPOINT"].strip().rstrip("/")
+api_key = st.secrets["AZURE_OPENAI_API_KEY"]
 
 # チャット（gpt-4o-mini）用クライアント
 client_chat = AzureOpenAI(
-    api_key=st.secrets["AZURE_OPENAI_API_KEY"],
+    api_key=api_key,
     api_version=st.secrets.get("AZURE_OPENAI_API_VERSION_CHAT", "2024-08-01-preview"),
     azure_endpoint=base_endpoint
-)
-
-# 音声（TTS / Whisper）用クライアント
-# 💡 404エラーを防ぐため、音声専用のデータ通信経路を指定する補正を追加しました
-client_audio = AzureOpenAI(
-    api_key=st.secrets["AZURE_OPENAI_API_KEY"],
-    api_version=st.secrets.get("AZURE_OPENAI_API_VERSION_AUDIO", "2024-02-15-preview"),
-    azure_endpoint=f"{base_endpoint}/openai"
 )
 
 # Googleドライブの保存先フォルダID
@@ -47,28 +41,55 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 # --- 2. Azure OpenAI 連携関数 ---
 
 def generate_ai_voice(text: str):
-    """【Azure OpenAI】TTS APIで質問テキストを音声に変換"""
+    """【Azure OpenAI】HTTPリクエストで確実にTTS音声を生成"""
     try:
-        response = client_audio.audio.speech.create(
-            model=st.secrets["AZURE_DEPLOYMENT_TTS"], # AzureのTTSデプロイ名
-            voice="alloy",
-            input=text
-        )
-        return response.content
+        deployment_tts = st.secrets["AZURE_DEPLOYMENT_TTS"]
+        version_audio = st.secrets.get("AZURE_OPENAI_API_VERSION_AUDIO", "2024-02-15-preview")
+        
+        # Azure専用のTTSエンドポイントURLを手動構築
+        url = f"{base_endpoint}/openai/deployments/{deployment_tts}/audio/speech?api-version={version_audio}"
+        
+        headers = {
+            "api-key": api_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": deployment_tts,
+            "input": text,
+            "voice": "alloy"
+        }
+        
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            return response.content
+        else:
+            st.error(f"TTS通信エラー ({response.status_code}): {response.text}")
+            return None
     except Exception as e:
         st.error(f"AI音声の生成に失敗しました: {e}")
         return None
 
 def transcribe_audio(audio_bytes) -> str:
-    """【Azure OpenAI】Whisperでの文字起こし処理"""
+    """【Azure OpenAI】HTTPリクエストで確実にWhisper文字起こし"""
     try:
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = "speech.wav"
-        transcript = client_audio.audio.transcriptions.create(
-            model=st.secrets["AZURE_DEPLOYMENT_WHISPER"], # AzureのWhisperデプロイ名
-            file=audio_file
-        )
-        return transcript.text
+        deployment_whisper = st.secrets["AZURE_DEPLOYMENT_WHISPER"]
+        version_audio = st.secrets.get("AZURE_OPENAI_API_VERSION_AUDIO", "2024-02-15-preview")
+        
+        # Azure専用のWhisperエンドポイントURLを手動構築
+        url = f"{base_endpoint}/openai/deployments/{deployment_whisper}/audio/transcriptions?api-version={version_audio}"
+        
+        headers = {
+            "api-key": api_key
+        }
+        files = {
+            "file": ("speech.wav", io.BytesIO(audio_bytes), "audio/wav")
+        }
+        
+        response = requests.post(url, headers=headers, files=files)
+        if response.status_code == 200:
+            return response.json().get("text", "")
+        else:
+            return f"[文字起こしエラー ({response.status_code}): {response.text}]"
     except Exception as e:
         return f"[文字起こし失敗: {e}]"
 
@@ -86,7 +107,7 @@ def evaluate_speech(student_text: str, question_text: str, criteria: str) -> str
         上記基準に基づき、判定（A/B/C）と、生徒への優しいアドバイス（日本語）を出力してください。
         """
         response = client_chat.chat.completions.create(
-            model=st.secrets["AZURE_DEPLOYMENT_CHAT"], # AzureのChatデプロイ名
+            model=st.secrets["AZURE_DEPLOYMENT_CHAT"],
             messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content
@@ -178,7 +199,7 @@ if mode == "先生用管理画面":
         correct_password = str(match_row.iloc[0]['Admin_Password'])
         current_config = match_row.iloc[0].to_dict()
     else:
-        correct_password = "password123"  # 新規登録時のデフォルトパスワード
+        correct_password = "password123"
         current_config = {"num_questions": 3}
         
     input_password = st.text_input("このクラスの設定用パスワードを入力してください", type="password")
@@ -234,7 +255,6 @@ else:
     if not st.session_state.test_started:
         st.subheader("受験者情報を入力してください")
         
-        # Configシートに存在する学校名・学年・クラスを一意に取得してプルダウンの選択肢にする
         available_schools = sorted(list(df_config_all['School'].dropna().unique())) if not df_config_all.empty else ["〇〇中学校"]
         available_grades = sorted(list(df_config_all['Grade'].dropna().unique())) if not df_config_all.empty else ["1年", "2年", "3年"]
         available_classes = sorted(list(df_config_all['Class'].dropna().unique())) if not df_config_all.empty else ["1組", "2組", "3組"]
@@ -242,10 +262,7 @@ else:
         school = st.selectbox("学校名", available_schools)
         grade = st.selectbox("学年", available_grades)
         class_num = st.selectbox("クラス", available_classes)
-        
-        # 出席番号を1〜50のプルダウン形式に変更
         attend_num = st.selectbox("出席番号", [i for i in range(1, 51)], index=0)
-        
         name = st.text_input("氏名")
         
         if st.button("テストを始める", type="primary"):
