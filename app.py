@@ -20,19 +20,22 @@ if "student_info" not in st.session_state:
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
 
-# 【重要】チャット用と音声用でクライアントを分離して初期化
+# エンドポイントの末尾を綺麗に整形
+base_endpoint = st.secrets["AZURE_OPENAI_ENDPOINT"].strip().rstrip("/")
+
 # チャット（gpt-4o-mini）用クライアント
 client_chat = AzureOpenAI(
     api_key=st.secrets["AZURE_OPENAI_API_KEY"],
     api_version=st.secrets.get("AZURE_OPENAI_API_VERSION_CHAT", "2024-08-01-preview"),
-    azure_endpoint=st.secrets["AZURE_OPENAI_ENDPOINT"]
+    azure_endpoint=base_endpoint
 )
 
 # 音声（TTS / Whisper）用クライアント
+# 💡 404エラーを防ぐため、音声専用のデータ通信経路を指定する補正を追加しました
 client_audio = AzureOpenAI(
     api_key=st.secrets["AZURE_OPENAI_API_KEY"],
     api_version=st.secrets.get("AZURE_OPENAI_API_VERSION_AUDIO", "2024-02-15-preview"),
-    azure_endpoint=st.secrets["AZURE_OPENAI_ENDPOINT"]
+    azure_endpoint=f"{base_endpoint}/openai"
 )
 
 # Googleドライブの保存先フォルダID
@@ -47,7 +50,7 @@ def generate_ai_voice(text: str):
     """【Azure OpenAI】TTS APIで質問テキストを音声に変換"""
     try:
         response = client_audio.audio.speech.create(
-            model=st.secrets["AZURE_DEPLOYMENT_TTS"], # AzureのTTSデプロブ名
+            model=st.secrets["AZURE_DEPLOYMENT_TTS"], # AzureのTTSデプロイ名
             voice="alloy",
             input=text
         )
