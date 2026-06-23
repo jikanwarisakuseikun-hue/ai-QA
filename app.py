@@ -20,6 +20,10 @@ if "student_info" not in st.session_state:
     st.session_state.student_info = {}
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
+if "play_counts" not in st.session_state:
+    st.session_state.play_counts = {}
+if "current_feedback" not in st.session_state:
+    st.session_state.current_feedback = None  # 現在の質問のフィードバック状態を保持
 
 # Gemini APIクライアントの初期化
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -137,7 +141,7 @@ def load_all_config():
         st.error(f"Configシートの読み込みに失敗しました: {e}")
         return pd.DataFrame()
 
-def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int):
+def save_results_to_sheet(student_info: dict, answers: dict, play_counts: dict, num_questions: int):
     """Resultsシートへデータを追記"""
     row_data = [
         str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -153,8 +157,9 @@ def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int)
             row_data.append(str(answers.get(f"q{i}_speech", "")))
             row_data.append(str(answers.get(f"q{i}_eval", "")))
             row_data.append(str(answers.get(f"q{i}_audio_url", "")))
+            row_data.append(str(play_counts.get(i, 0)))
         else:
-            row_data.extend(["", "", ""])
+            row_data.extend(["", "", "", ""])
             
     try:
         sh = get_spreadsheet()
@@ -216,12 +221,13 @@ if not st.session_state.test_started:
                     st.session_state.test_started = True
                     st.session_state.current_q_idx = 1
                     st.session_state.answers_cache = {}
+                    st.session_state.play_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+                    st.session_state.current_feedback = None
                     st.rerun()
 
 else:
     student_config = st.session_state.student_info["config"]
     
-    # 質問数を安全に数値（int）へ変換
     try:
         num_questions = int(float(student_config.get("num_questions", 3)))
     except:
@@ -240,30 +246,68 @@ else:
                 st.session_state[voice_key] = generate_ai_voice(q_text)
         
         st.markdown("#### 🎧 1. AIの質問を聴いてください")
-        if st.session_state[voice_key]:
+        
+        ccount = st.session_state.play_counts.get(idx, 0)
+        btn_label = f"🔊 質問を再生する (現在の再生回数: {ccount}回)"
+        
+        # フィードバック表示中は再生ボタンを無効化
+        if st.button(btn_label, key=f"play_btn_{idx}", disabled=(st.session_state.current_feedback is not None)):
+            st.session_state.play_counts[idx] = ccount + 1
+            st.audio(st.session_state[voice_key], format="audio/mp3", autoplay=True)
+        elif ccount > 0:
             st.audio(st.session_state[voice_key], format="audio/mp3")
+        else:
+            st.info("上のボタンを押すと、AIの質問音声が流れます。")
         
         st.markdown("---")
         st.markdown("#### 🗣️ 2. あなたの回答を録音してください")
-        audio_file = st.audio_input("ここを押して発話・録音", key=f"audio_{idx}")
         
-        if st.button("回答を送信して次へ進む", type="primary", key=f"submit_{idx}"):
-            if audio_file is None:
-                st.warning("音声が録音されていません。")
-            else:
-                with st.spinner("Geminiが音声を直接分析し、採点を行っています..."):
-                    audio_bytes = audio_file.read()
-                    info = st.session_state.student_info
-                    
-                    file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
-                    audio_url = upload_to_drive(audio_bytes, file_name)
-                    
-                    student_speech, eval_result = analyze_and_evaluate(audio_bytes, q_text, q_criteria)
-                    
-                    st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
-                    st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
-                    st.session_state.answers_cache[f"q{idx}_audio_url"] = str(audio_url)
-                    
+        # フィードバック未生成の時だけ録音UIと送信ボタンを表示
+        if st.session_state.current_feedback is None:
+            audio_file = st.audio_input("ここを押して発話・録音", key=f"audio_{idx}")
+            
+            if st.button("回答を送信する", type="primary", key=f"submit_{idx}"):
+                if audio_file is None:
+                    st.warning("音声が録音されていません。")
+                elif st.session_state.play_counts[idx] == 0:
+                    st.warning("まず質問を聴いてください。")
+                else:
+                    with st.spinner("AIがあなたの英語を分析中... 📝"):
+                        audio_bytes = audio_file.read()
+                        info = st.session_state.student_info
+                        
+                        file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
+                        audio_url = upload_to_drive(audio_bytes, file_name)
+                        
+                        student_speech, eval_result = analyze_and_evaluate(audio_bytes, q_text, q_criteria)
+                        
+                        # キャッシュに保存
+                        st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
+                        st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
+                        st.session_state.answers_cache[f"q{idx}_audio_url"] = str(audio_url)
+                        
+                        # 即時フィードバック用に状態をセット
+                        st.session_state.current_feedback = {
+                            "speech": student_speech,
+                            "eval": eval_result
+                        }
+                    st.rerun()
+        
+        # 【即時フィードバック画面】送信が完了している場合、その場に結果を表示
+        if st.session_state.current_feedback is not None:
+            st.success("🎯 回答の送信が完了しました！AI教師からのフィードバックです。")
+            
+            # 視覚的に分かりやすい枠で囲んで表示
+            with st.container(border=True):
+                st.markdown("#### 🗣️ あなたが話した英語（AIの文字起こし）")
+                st.code(st.session_state.current_feedback["speech"], language="text")
+                
+                st.markdown("#### 📝 採点・アドバイス")
+                st.info(st.session_state.current_feedback["eval"])
+            
+            st.markdown("確認したら、下のボタンを押して次の問題に進んでください。")
+            if st.button("次の質問へ進む ➡️", type="primary", key=f"next_btn_{idx}"):
+                st.session_state.current_feedback = None  # フィードバック状態をクリア
                 st.session_state.current_q_idx += 1
                 st.rerun()
                 
@@ -277,6 +321,7 @@ else:
                 save_results_to_sheet(
                     st.session_state.student_info,
                     st.session_state.answers_cache,
+                    st.session_state.play_counts,
                     num_questions
                 )
             st.session_state.data_saved = True
