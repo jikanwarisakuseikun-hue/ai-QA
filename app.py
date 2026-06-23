@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import datetime
 import io
+import time
 import google.generativeai as genai
 from gtts import gTTS
 from googleapiclient.discovery import build
@@ -20,10 +21,12 @@ if "student_info" not in st.session_state:
     st.session_state.student_info = {}
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
-if "play_counts" not in st.session_state:
-    st.session_state.play_counts = {}
+if "start_time" not in st.session_state:
+    st.session_state.start_time = None  # 各質問の開始時刻
+if "time_records" not in st.session_state:
+    st.session_state.time_records = {}  # 各質問の解答時間を記録
 if "current_feedback" not in st.session_state:
-    st.session_state.current_feedback = None  # 現在の質問のフィードバック状態を保持
+    st.session_state.current_feedback = None
 
 # Gemini APIクライアントの初期化
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
@@ -141,8 +144,8 @@ def load_all_config():
         st.error(f"Configシートの読み込みに失敗しました: {e}")
         return pd.DataFrame()
 
-def save_results_to_sheet(student_info: dict, answers: dict, play_counts: dict, num_questions: int):
-    """Resultsシートへデータを追記"""
+def save_results_to_sheet(student_info: dict, answers: dict, time_records: dict, num_questions: int):
+    """Resultsシートへデータを追記 (解答時間カラムに対応)"""
     row_data = [
         str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         str(student_info.get("school", "")),
@@ -152,12 +155,13 @@ def save_results_to_sheet(student_info: dict, answers: dict, play_counts: dict, 
         str(student_info.get("name", "")),
     ]
     
+    # 各Questionごとに「文字起こし」「評価」「音声リンク」「解答時間」の4つをセットで追加
     for i in range(1, 6):
         if i <= num_questions:
             row_data.append(str(answers.get(f"q{i}_speech", "")))
             row_data.append(str(answers.get(f"q{i}_eval", "")))
             row_data.append(str(answers.get(f"q{i}_audio_url", "")))
-            row_data.append(str(play_counts.get(i, 0)))
+            row_data.append(str(time_records.get(i, 0)))  # 解答時間(秒)を追加
         else:
             row_data.extend(["", "", "", ""])
             
@@ -221,7 +225,8 @@ if not st.session_state.test_started:
                     st.session_state.test_started = True
                     st.session_state.current_q_idx = 1
                     st.session_state.answers_cache = {}
-                    st.session_state.play_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+                    st.session_state.time_records = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+                    st.session_state.start_time = None  # 初期化
                     st.session_state.current_feedback = None
                     st.rerun()
 
@@ -240,38 +245,37 @@ else:
         q_text = student_config.get(f"q{idx}_text", "")
         q_criteria = student_config.get(f"q{idx}_criteria", "")
         
+        # 質問画面がロードされた瞬間の時刻を記録（1回だけ設定）
+        if st.session_state.start_time is None:
+            st.session_state.start_time = time.time()
+            
         voice_key = f"ai_voice_{idx}"
         if voice_key not in st.session_state:
             with st.spinner("AIが質問音声を生成しています... 🎧"):
                 st.session_state[voice_key] = generate_ai_voice(q_text)
         
         st.markdown("#### 🎧 1. AIの質問を聴いてください")
-        
-        ccount = st.session_state.play_counts.get(idx, 0)
-        btn_label = f"🔊 質問を再生する (現在の再生回数: {ccount}回)"
-        
-        # フィードバック表示中は再生ボタンを無効化
-        if st.button(btn_label, key=f"play_btn_{idx}", disabled=(st.session_state.current_feedback is not None)):
-            st.session_state.play_counts[idx] = ccount + 1
-            st.audio(st.session_state[voice_key], format="audio/mp3", autoplay=True)
-        elif ccount > 0:
+        if st.session_state[voice_key]:
             st.audio(st.session_state[voice_key], format="audio/mp3")
-        else:
-            st.info("上のボタンを押すと、AIの質問音声が流れます。")
+        
+        # 経過時間を計算してリアルタイム表示
+        elapsed_time = int(time.time() - st.session_state.start_time)
+        st.caption(f"⏱️ この問題の経過時間: **{elapsed_time}秒**")
         
         st.markdown("---")
         st.markdown("#### 🗣️ 2. あなたの回答を録音してください")
         
-        # フィードバック未生成の時だけ録音UIと送信ボタンを表示
         if st.session_state.current_feedback is None:
             audio_file = st.audio_input("ここを押して発話・録音", key=f"audio_{idx}")
             
             if st.button("回答を送信する", type="primary", key=f"submit_{idx}"):
                 if audio_file is None:
                     st.warning("音声が録音されていません。")
-                elif st.session_state.play_counts[idx] == 0:
-                    st.warning("まず質問を聴いてください。")
                 else:
+                    # 送信された瞬間に解答時間を確定
+                    final_elapsed = int(time.time() - st.session_state.start_time)
+                    st.session_state.time_records[idx] = final_elapsed
+                    
                     with st.spinner("AIがあなたの英語を分析中... 📝"):
                         audio_bytes = audio_file.read()
                         info = st.session_state.student_info
@@ -281,33 +285,33 @@ else:
                         
                         student_speech, eval_result = analyze_and_evaluate(audio_bytes, q_text, q_criteria)
                         
-                        # キャッシュに保存
                         st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
                         st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
                         st.session_state.answers_cache[f"q{idx}_audio_url"] = str(audio_url)
                         
-                        # 即時フィードバック用に状態をセット
                         st.session_state.current_feedback = {
                             "speech": student_speech,
                             "eval": eval_result
                         }
                     st.rerun()
         
-        # 【即時フィードバック画面】送信が完了している場合、その場に結果を表示
         if st.session_state.current_feedback is not None:
             st.success("🎯 回答の送信が完了しました！AI教師からのフィードバックです。")
             
-            # 視覚的に分かりやすい枠で囲んで表示
             with st.container(border=True):
                 st.markdown("#### 🗣️ あなたが話した英語（AIの文字起こし）")
                 st.code(st.session_state.current_feedback["speech"], language="text")
                 
                 st.markdown("#### 📝 採点・アドバイス")
                 st.info(st.session_state.current_feedback["eval"])
+                
+                # 解答時間をフィードバックエリアにもおまけ表示
+                st.write(f"⏱️ かかった時間: **{st.session_state.time_records[idx]}秒**")
             
             st.markdown("確認したら、下のボタンを押して次の問題に進んでください。")
             if st.button("次の質問へ進む ➡️", type="primary", key=f"next_btn_{idx}"):
-                st.session_state.current_feedback = None  # フィードバック状態をクリア
+                st.session_state.current_feedback = None
+                st.session_state.start_time = None  # 次の問題のためにタイマーリセット
                 st.session_state.current_q_idx += 1
                 st.rerun()
                 
@@ -321,7 +325,7 @@ else:
                 save_results_to_sheet(
                     st.session_state.student_info,
                     st.session_state.answers_cache,
-                    st.session_state.play_counts,
+                    st.session_state.time_records,
                     num_questions
                 )
             st.session_state.data_saved = True
