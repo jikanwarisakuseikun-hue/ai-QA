@@ -11,7 +11,7 @@ from google.oauth2 import service_account
 import gspread
 
 # --- 1. ページ基本設定 & セッション状態の初期化 ---
-st.set_page_config(page_title="AI英語QAテスト (Gemini)", page_icon="🇬🇧", layout="centered")
+st.set_page_config(page_title="AI英語QAテスト", page_icon="🇬🇧", layout="centered")
 
 if "test_started" not in st.session_state:
     st.session_state.test_started = False
@@ -259,7 +259,7 @@ else:
             with st.spinner("AIが質問音声を生成しています... 🎧"):
                 st.session_state[voice_key] = generate_ai_voice(q_text)
         
-        st.markdown("#### 🎧 1. AI的質問を聴いてください")
+        st.markdown("#### 🎧 1. AIの質問を聴いてください")
         if st.session_state[voice_key]:
             st.audio(st.session_state[voice_key], format="audio/mp3")
         
