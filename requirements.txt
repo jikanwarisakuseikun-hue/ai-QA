@@ -1,6 +1,8 @@
 streamlit
-st-gsheets-connection
+streamlit-gsheets
 pandas
-openai
 google-api-python-client
 google-auth
+google-genai
+gTTS
+requests
