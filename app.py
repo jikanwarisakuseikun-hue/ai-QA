@@ -3,14 +3,15 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import datetime
 import io
-import requests
-from openai import AzureOpenAI
+from google import genai
+from google.genai import types
+from gtts import gTTS
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2 import service_account
 
 # --- 1. ページ基本設定 & セッション状態の初期化 ---
-st.set_page_config(page_title="AI英語QAテスト (Azure)", page_icon="🇬🇧", layout="centered")
+st.set_page_config(page_title="AI英語QAテスト (Gemini)", page_icon="🇬🇧", layout="centered")
 
 if "test_started" not in st.session_state:
     st.session_state.test_started = False
@@ -21,16 +22,8 @@ if "student_info" not in st.session_state:
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
 
-# エンドポイントとキーの基本情報
-base_endpoint = st.secrets["AZURE_OPENAI_ENDPOINT"].strip().rstrip("/")
-api_key = st.secrets["AZURE_OPENAI_API_KEY"]
-
-# チャット（gpt-4o-mini）用クライアント
-client_chat = AzureOpenAI(
-    api_key=api_key,
-    api_version=st.secrets.get("AZURE_OPENAI_API_VERSION_CHAT", "2024-08-01-preview"),
-    azure_endpoint=base_endpoint
-)
+# Gemini APIクライアントの初期化 (APIキー1つで認証完了)
+client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 # Googleドライブの保存先フォルダID
 GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
@@ -38,81 +31,75 @@ GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
 # スプレッドシート接続
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- 2. Azure OpenAI 連携関数 ---
+# --- 2. AI & 音声 連携関数 ---
 
 def generate_ai_voice(text: str):
-    """【Azure OpenAI】HTTPリクエストで確実にTTS音声を生成"""
+    """【完全無料】gTTSを使用して英語テキストから高精度な音声を生成"""
     try:
-        deployment_tts = st.secrets["AZURE_DEPLOYMENT_TTS"]
-        version_audio = st.secrets.get("AZURE_OPENAI_API_VERSION_AUDIO", "2024-02-15-preview")
-        
-        # Azure専用のTTSエンドポイントURLを手動構築
-        url = f"{base_endpoint}/openai/deployments/{deployment_tts}/audio/speech?api-version={version_audio}"
-        
-        headers = {
-            "api-key": api_key,
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": deployment_tts,
-            "input": text,
-            "voice": "alloy"
-        }
-        
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            return response.content
-        else:
-            st.error(f"TTS通信エラー ({response.status_code}): {response.text}")
-            return None
+        # 英語(en)で音声合成オブジェクトを作成
+        tts = gTTS(text=text, lang='en', slow=False)
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        return fp.read()
     except Exception as e:
         st.error(f"AI音声の生成に失敗しました: {e}")
         return None
 
-def transcribe_audio(audio_bytes) -> str:
-    """【Azure OpenAI】HTTPリクエストで確実にWhisper文字起こし"""
+def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
+    """【Gemini API】音声からダイレクトに「文字起こし」と「採点」を同時に実行"""
     try:
-        deployment_whisper = st.secrets["AZURE_DEPLOYMENT_WHISPER"]
-        version_audio = st.secrets.get("AZURE_OPENAI_API_VERSION_AUDIO", "2024-02-15-preview")
-        
-        # Azure専用のWhisperエンドポイントURLを手動構築
-        url = f"{base_endpoint}/openai/deployments/{deployment_whisper}/audio/transcriptions?api-version={version_audio}"
-        
-        headers = {
-            "api-key": api_key
-        }
-        files = {
-            "file": ("speech.wav", io.BytesIO(audio_bytes), "audio/wav")
-        }
-        
-        response = requests.post(url, headers=headers, files=files)
-        if response.status_code == 200:
-            return response.json().get("text", "")
-        else:
-            return f"[文字起こしエラー ({response.status_code}): {response.text}]"
-    except Exception as e:
-        return f"[文字起こし失敗: {e}]"
-
-def evaluate_speech(student_text: str, question_text: str, criteria: str) -> str:
-    """【Azure OpenAI】ChatGPTによる文法チェック・採点"""
-    try:
-        prompt = f"""
-        あなたは中学校の英語教師です。生徒の回答を採点・評価してください。
-        質問: {question_text}
-        生徒の回答: {student_text}
-        
-        【採点・評価基準】
-        {criteria}
-        
-        上記基準に基づき、判定（A/B/C）と、生徒への優しいアドバイス（日本語）を出力してください。
-        """
-        response = client_chat.chat.completions.create(
-            model=st.secrets["AZURE_DEPLOYMENT_CHAT"],
-            messages=[{"role": "user", "content": prompt}]
+        # 音声バイトデータをGeminiが認識できるPart形式に変換
+        audio_part = types.Part.from_bytes(
+            data=audio_bytes,
+            mime_type="audio/wav"
         )
-        return response.choices[0].message.content
+        
+        prompt = f"""
+        あなたは中学校の英語教師です。
+        添付された生徒の録音音声（英語）を聴いて、以下の2つのタスクを行ってください。
+
+        【タスク1: 文字起こし】
+        生徒が何と言っているか、英語で正確に文字起こししてください。
+        （聴き取りが難しい場合でも、予測される英語を記述してください）
+
+        【タスク2: 採点・評価】
+        先生が提示した質問と評価基準に照らし合わせて、生徒の回答を採点してください。
+        質問: {question_text}
+        評価基準: {criteria}
+
+        【出力フォーマット】
+        必ず以下の形式で出力してください。これ以外の挨拶などは含めないでください。
+        
+        ■文字起こし:
+        (ここに文字起こしした英文)
+        
+        ■評価結果:
+        判定: (A / B / C のいずれか)
+        アドバイス: (生徒への優しい日本語のアドバイス)
+        """
+        
+        # マルチモーダル対応の「gemini-2.5-flash」を使用
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[audio_part, prompt]
+        )
+        
+        result_text = response.text
+        
+        # 文字起こし部分と評価部分をパースして切り分ける
+        student_speech = "[文字起こしの抽出に失敗しました]"
+        eval_result = result_text
+        
+        if "■文字起こし:" in result_text and "■評価結果:" in result_text:
+            parts = result_text.split("■評価結果:")
+            eval_result = "■評価結果:" + parts[1]
+            student_speech = parts[0].replace("■文字起こし:", "").strip()
+            
+        return student_speech, eval_result
+
     except Exception as e:
-        return f"[AI採点失敗: {e}]"
+        return f"[分析失敗: {e}]", f"[AI採点失敗: {e}]"
 
 def upload_to_drive(audio_bytes, file_name) -> str:
     """Googleドライブの指定フォルダへ音声をアップロードし、URLを返す"""
@@ -143,7 +130,7 @@ def save_all_config(df_config):
     st.cache_data.clear()
 
 def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int):
-    """Resultsシートへ1人1行（横並び）でデータを追加保存"""
+    """Resultsシートへデータを保存"""
     row_data = {
         "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "School": student_info.get("school"),
@@ -176,19 +163,17 @@ def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int)
 st.sidebar.title("メニュー")
 mode = st.sidebar.radio("画面を選択してください", ["生徒用テスト画面", "先生用管理画面"])
 
-# 全体の設定データを事前に読み込み
 df_config_all = load_all_config()
 
 # --- 5. 先生用管理画面 ---
 if mode == "先生用管理画面":
-    st.title("🛠️ 先生用管理画面 (Azure)")
+    st.title("🛠️ 先生用管理画面 (Gemini)")
     
     st.subheader("設定対象のクラスを選択してください")
     tgt_school = st.text_input("学校名", value="〇〇中学校")
     tgt_grade = st.selectbox("学年", ["1年", "2年", "3年"], key="m_grade")
     tgt_class = st.selectbox("クラス", [f"{i}組" for i in range(1, 6)], key="m_class")
     
-    # 選択されたクラスの行を抽出
     match_row = df_config_all[
         (df_config_all['School'] == tgt_school) & 
         (df_config_all['Grade'] == tgt_grade) & 
@@ -208,7 +193,7 @@ if mode == "先生用管理画面":
         st.success(f"🔓 認証成功: {tgt_school} {tgt_grade}{tgt_class} 設定画面")
         st.markdown("---")
         
-        new_password = st.text_input("管理用パスワード（スプレッドシート内を上書き変更）", value=correct_password)
+        new_password = st.text_input("管理用パスワード", value=correct_password)
         
         try:
             init_num = int(current_config.get("num_questions", 3))
@@ -216,7 +201,6 @@ if mode == "先生用管理画面":
             init_num = 3
         new_num = st.selectbox("質問数", options=[1, 2, 3, 4, 5], index=init_num-1)
         
-        # 保存データの土台作成
         updated_row_dict = {
             "School": tgt_school, "Grade": tgt_grade, "Class": tgt_class,
             "Admin_Password": new_password, "num_questions": new_num
@@ -263,11 +247,11 @@ else:
         grade = st.selectbox("学年", available_grades)
         class_num = st.selectbox("クラス", available_classes)
         attend_num = st.selectbox("出席番号", [i for i in range(1, 51)], index=0)
-        name = st.text_input("氏名")
+        name = st.text_input("氏名（例：タロウ / ニックネームなど個人が特定できないもの）")
         
         if st.button("テストを始める", type="primary"):
             if name.strip() == "":
-                st.warning("氏名を入力してください。")
+                st.warning("受験者の氏名・ニックネームを入力してください。")
             else:
                 student_config = df_config_all[
                     (df_config_all['School'] == school) & 
@@ -300,7 +284,7 @@ else:
             
             voice_key = f"ai_voice_{idx}"
             if voice_key not in st.session_state:
-                with st.spinner("AIが質問を準備しています... 🎧"):
+                with st.spinner("AIが質問音声を生成しています... 🎧"):
                     st.session_state[voice_key] = generate_ai_voice(q_text)
             
             st.markdown("#### 🎧 1. AIの質問を聴いてください")
@@ -317,15 +301,15 @@ else:
                 if audio_file is None:
                     st.warning("音声が録音されていません。")
                 else:
-                    with st.spinner("音声を分析して、次の問題へ移動しています..."):
+                    with st.spinner("Geminiが音声を直接分析し、採点を行っています..."):
                         audio_bytes = audio_file.read()
                         info = st.session_state.student_info
                         
                         file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
                         audio_url = upload_to_drive(audio_bytes, file_name)
                         
-                        student_speech = transcribe_audio(audio_bytes)
-                        eval_result = evaluate_speech(student_speech, q_text, q_criteria)
+                        # Geminiに音声を直接渡し、文字起こしと採点を同時実行
+                        student_speech, eval_result = analyze_and_evaluate(audio_bytes, q_text, q_criteria)
                         
                         st.session_state.answers_cache[f"q{idx}_speech"] = student_speech
                         st.session_state.answers_cache[f"q{idx}_eval"] = eval_result
