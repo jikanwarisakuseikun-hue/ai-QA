@@ -3,8 +3,7 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import datetime
 import io
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 from gtts import gTTS
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -22,8 +21,8 @@ if "student_info" not in st.session_state:
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
 
-# Gemini APIクライアントの初期化 (APIキー1つで認証完了)
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+# Gemini APIクライアントの初期化 (最も安定して動くライブラリを使用)
+genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 # Googleドライブの保存先フォルダID
 GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
@@ -49,12 +48,6 @@ def generate_ai_voice(text: str):
 def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
     """【Gemini API】音声からダイレクトに「文字起こし」と「採点」を同時に実行"""
     try:
-        # 音声バイトデータをGeminiが認識できるPart形式に変換
-        audio_part = types.Part.from_bytes(
-            data=audio_bytes,
-            mime_type="audio/wav"
-        )
-        
         prompt = f"""
         あなたは中学校の英語教師です。
         添付された生徒の録音音声（英語）を聴いて、以下の2つのタスクを行ってください。
@@ -80,10 +73,11 @@ def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
         """
         
         # マルチモーダル対応の「gemini-2.5-flash」を使用
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[audio_part, prompt]
-        )
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        response = model.generate_content([
+            {'mime_type': 'audio/wav', 'data': audio_bytes},
+            prompt
+        ])
         
         result_text = response.text
         
@@ -287,7 +281,7 @@ else:
                 with st.spinner("AIが質問音声を生成しています... 🎧"):
                     st.session_state[voice_key] = generate_ai_voice(q_text)
             
-            st.markdown("#### 🎧 1. AIの質問を聴してください")
+            st.markdown("#### 🎧 1. AIの質問を聴いてください")
             if st.session_state[voice_key]:
                 st.audio(st.session_state[voice_key], format="audio/mp3")
             
@@ -337,3 +331,12 @@ else:
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
                 st.rerun()
+
+# --- 7. 著作権表示（フッター） ---
+st.markdown("---")
+st.markdown(
+    "<div style='text-align: center; color: #888888; font-size: 0.8em;'>"
+    "© 2026 AI English QA Test System. All Rights Reserved."
+    "</div>",
+    unsafe_allow_html=True
+)
