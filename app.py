@@ -27,7 +27,7 @@ genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 # Googleドライブの保存先フォルダID
 GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
 
-# --- 2. スプレッドシート接続の初期化 (エラー回避用) ---
+# --- 2. スプレッドシート接続の初期化 ---
 @st.cache_resource
 def get_gspread_client():
     creds_info = st.secrets["connections"]["gsheets"]
@@ -40,7 +40,6 @@ def get_gspread_client():
 
 def get_spreadsheet():
     gc = get_gspread_client()
-    # Secrets内のURLからIDを抽出して開く
     sheet_url = st.secrets["spreadsheet"]
     return gc.open_by_url(sheet_url)
 
@@ -139,26 +138,29 @@ def save_all_config(df_config):
         sh = get_spreadsheet()
         worksheet = sh.worksheet("Config")
         worksheet.clear()
-        worksheet.update([df_config.columns.values.tolist()] + df_config.values.tolist())
+        # すべてのデータを安全な文字列に変換して保存
+        string_data = df_config.astype(str).values.tolist()
+        worksheet.update([df_config.columns.values.tolist()] + string_data)
     except Exception as e:
         st.error(f"Configシートの更新に失敗しました: {e}")
 
 def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int):
-    """Resultsシートへデータを追記"""
+    """Resultsシートへデータを追記 (int64シリアライズエラー対策版)"""
+    # 出席番号や学年などを、すべてプレーンな「文字列(str)」に変換してエラーを完全回避
     row_data = [
-        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        student_info.get("school", ""),
-        student_info.get("grade", ""),
-        student_info.get("class_num", ""),
+        str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        str(student_info.get("school", "")),
+        str(student_info.get("grade", "")),
+        str(student_info.get("class_num", "")),
         str(student_info.get("attend_num", "")),
-        student_info.get("name", ""),
+        str(student_info.get("name", "")),
     ]
     
     for i in range(1, 6):
         if i <= num_questions:
-            row_data.append(answers.get(f"q{i}_speech", ""))
-            row_data.append(answers.get(f"q{i}_eval", ""))
-            row_data.append(answers.get(f"q{i}_audio_url", ""))
+            row_data.append(str(answers.get(f"q{i}_speech", "")))
+            row_data.append(str(answers.get(f"q{i}_eval", "")))
+            row_data.append(str(answers.get(f"q{i}_audio_url", "")))
         else:
             row_data.extend(["", "", ""])
             
@@ -186,10 +188,12 @@ if mode == "先生用管理画面":
     tgt_class = st.selectbox("クラス", [f"{i}組" for i in range(1, 6)], key="m_class")
     
     if not df_config_all.empty and 'School' in df_config_all.columns:
+        # 比較用に文字列に統一
+        df_config_all = df_config_all.astype(str)
         match_row = df_config_all[
-            (df_config_all['School'] == tgt_school) & 
-            (df_config_all['Grade'] == tgt_grade) & 
-            (df_config_all['Class'] == tgt_class)
+            (df_config_all['School'] == str(tgt_school)) & 
+            (df_config_all['Grade'] == str(tgt_grade)) & 
+            (df_config_all['Class'] == str(tgt_class))
         ]
     else:
         match_row = pd.DataFrame()
@@ -216,8 +220,8 @@ if mode == "先生用管理画面":
         new_num = st.selectbox("質問数", options=[1, 2, 3, 4, 5], index=init_num-1)
         
         updated_row_dict = {
-            "School": tgt_school, "Grade": tgt_grade, "Class": tgt_class,
-            "Admin_Password": new_password, "num_questions": new_num
+            "School": str(tgt_school), "Grade": str(tgt_grade), "Class": str(tgt_class),
+            "Admin_Password": str(new_password), "num_questions": str(new_num)
         }
         
         for i in range(1, 6):
@@ -226,8 +230,8 @@ if mode == "先生用管理画面":
                 def_text = current_config.get(f"q{i}_text", f"Question {i}?") if not match_row.empty else f"Question {i}?"
                 def_crit = current_config.get(f"q{i}_criteria", "正しく答えられているか。") if not match_row.empty else "判定基準を入力"
                 
-                updated_row_dict[f"q{i}_text"] = st.text_input(f"Q{i} 英語テキスト", value=def_text, key=f"t_{i}")
-                updated_row_dict[f"q{i}_criteria"] = st.text_area(f"Q{i} 評価基準", value=def_crit, key=f"c_{i}")
+                updated_row_dict[f"q{i}_text"] = str(st.text_input(f"Q{i} 英語テキスト", value=def_text, key=f"t_{i}"))
+                updated_row_dict[f"q{i}_criteria"] = str(st.text_area(f"Q{i} 評価基準", value=def_crit, key=f"c_{i}"))
             else:
                 updated_row_dict[f"q{i}_text"] = ""
                 updated_row_dict[f"q{i}_criteria"] = ""
@@ -254,6 +258,8 @@ else:
         st.subheader("受験者情報を入力してください")
         
         if not df_config_all.empty and 'School' in df_config_all.columns:
+            # 念のため文字列化
+            df_config_all = df_config_all.astype(str)
             available_schools = sorted(list(df_config_all['School'].dropna().unique()))
             available_grades = sorted(list(df_config_all['Grade'].dropna().unique()))
             available_classes = sorted(list(df_config_all['Class'].dropna().unique()))
@@ -275,10 +281,11 @@ else:
                 if df_config_all.empty:
                     st.error("スプレッドシートのConfigシートからデータを読み込めませんでした。先生画面で先に問題を設定するか、シートを確認してください。")
                 else:
+                    df_config_all = df_config_all.astype(str)
                     student_config = df_config_all[
-                        (df_config_all['School'] == school) & 
-                        (df_config_all['Grade'] == grade) & 
-                        (df_config_all['Class'] == class_num)
+                        (df_config_all['School'] == str(school)) & 
+                        (df_config_all['Grade'] == str(grade)) & 
+                        (df_config_all['Class'] == str(class_num))
                     ]
                     
                     if student_config.empty:
@@ -313,7 +320,7 @@ else:
             if st.session_state[voice_key]:
                 st.audio(st.session_state[voice_key], format="audio/mp3")
             
-            st.info(f"👉 (画面補助テキスト): {q_text}")
+            # 【変更点】画面補助テキスト（q_textの文字表示）を完全に削除しました
             
             st.markdown("---")
             st.markdown("#### 🗣️ 2. あなたの回答を録音してください")
@@ -359,11 +366,11 @@ else:
                     del st.session_state[key]
                 st.rerun()
 
-# --- 7. 著作権表示（フッター） ---
+# --- 8. 著作権表示（フッター） ---
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #888888; font-size: 0.8em;'>"
-    "© 2026 AI English QA Test System. All Rights Reserved."
+    "© 2026 Shogo Takeuchi. All Rights Reserved."
     "</div>",
     unsafe_allow_html=True
 )
