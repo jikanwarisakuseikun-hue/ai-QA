@@ -373,7 +373,7 @@ else:
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #888888; font-size: 0.8em;'>"
-    "© 2026 自分の名前 (例: T. Yamada). All Rights Reserved."
+    "© 2026 Shogo Takeuchi. All Rights Reserved."
     "</div>",
     unsafe_allow_html=True
 )
