@@ -1,5 +1,4 @@
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import datetime
 import io
@@ -8,6 +7,7 @@ from gtts import gTTS
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2 import service_account
+import gspread
 
 # --- 1. ページ基本設定 & セッション状態の初期化 ---
 st.set_page_config(page_title="AI英語QAテスト (Gemini)", page_icon="🇬🇧", layout="centered")
@@ -21,21 +21,34 @@ if "student_info" not in st.session_state:
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
 
-# Gemini APIクライアントの初期化 (最も安定して動くライブラリを使用)
+# Gemini APIクライアントの初期化
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 # Googleドライブの保存先フォルダID
 GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
 
-# スプレッドシート接続
-conn = st.connection("gsheets", type=GSheetsConnection)
+# --- 2. スプレッドシート接続の初期化 (エラー回避用) ---
+@st.cache_resource
+def get_gspread_client():
+    creds_info = st.secrets["connections"]["gsheets"]
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(creds)
 
-# --- 2. AI & 音声 連携関数 ---
+def get_spreadsheet():
+    gc = get_gspread_client()
+    # Secrets内のURLからIDを抽出して開く
+    sheet_url = st.secrets["spreadsheet"]
+    return gc.open_by_url(sheet_url)
+
+# --- 3. AI & 音声 連携関数 ---
 
 def generate_ai_voice(text: str):
     """【完全無料】gTTSを使用して英語テキストから高精度な音声を生成"""
     try:
-        # 英語(en)で音声合成オブジェクトを作成
         tts = gTTS(text=text, lang='en', slow=False)
         fp = io.BytesIO()
         tts.write_to_fp(fp)
@@ -54,7 +67,6 @@ def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
 
         【タスク1: 文字起こし】
         生徒が何と言っているか、英語で正確に文字起こししてください。
-        （聴き取りが難しい場合でも、予測される英語を記述してください）
 
         【タスク2: 採点・評価】
         先生が提示した質問と評価基準に照らし合わせて、生徒の回答を採点してください。
@@ -72,7 +84,6 @@ def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
         アドバイス: (生徒への優しい日本語のアドバイス)
         """
         
-        # マルチモーダル対応の「gemini-2.5-flash」を使用
         model = genai.GenerativeModel('gemini-2.5-flash')
         response = model.generate_content([
             {'mime_type': 'audio/wav', 'data': audio_bytes},
@@ -80,8 +91,6 @@ def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
         ])
         
         result_text = response.text
-        
-        # 文字起こし部分と評価部分をパースして切り分ける
         student_speech = "[文字起こしの抽出に失敗しました]"
         eval_result = result_text
         
@@ -91,7 +100,6 @@ def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
             student_speech = parts[0].replace("■文字起こし:", "").strip()
             
         return student_speech, eval_result
-
     except Exception as e:
         return f"[分析失敗: {e}]", f"[AI採点失敗: {e}]"
 
@@ -112,54 +120,63 @@ def upload_to_drive(audio_bytes, file_name) -> str:
         st.error(f"Googleドライブへのアップロードに失敗しました: {e}")
         return "Upload Failed"
 
-# --- 3. スプレッドシート操作関数 ---
+# --- 4. スプレッドシート操作関数 ---
 
 def load_all_config():
     """Configシートを全件取得"""
-    return conn.read(worksheet="Config", ttl=0)
+    try:
+        sh = get_spreadsheet()
+        worksheet = sh.worksheet("Config")
+        data = worksheet.get_all_records()
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.error(f"Configシートの読み込みに失敗しました: {e}")
+        return pd.DataFrame()
 
 def save_all_config(df_config):
     """Configシート全体を上書き保存"""
-    conn.update(worksheet="Config", data=df_config)
-    st.cache_data.clear()
+    try:
+        sh = get_spreadsheet()
+        worksheet = sh.worksheet("Config")
+        worksheet.clear()
+        worksheet.update([df_config.columns.values.tolist()] + df_config.values.tolist())
+    except Exception as e:
+        st.error(f"Configシートの更新に失敗しました: {e}")
 
 def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int):
-    """Resultsシートへデータを保存"""
-    row_data = {
-        "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "School": student_info.get("school"),
-        "Grade": student_info.get("grade"),
-        "Class": student_info.get("class_num"),
-        "Number": student_info.get("attend_num"),
-        "Name": student_info.get("name"),
-    }
+    """Resultsシートへデータを追記"""
+    row_data = [
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        student_info.get("school", ""),
+        student_info.get("grade", ""),
+        student_info.get("class_num", ""),
+        str(student_info.get("attend_num", "")),
+        student_info.get("name", ""),
+    ]
     
     for i in range(1, 6):
         if i <= num_questions:
-            row_data[f"Q{i}_Speech"] = answers.get(f"q{i}_speech", "")
-            row_data[f"Q{i}_Eval"] = answers.get(f"q{i}_eval", "")
-            row_data[f"Q{i}_Audio_Link"] = answers.get(f"q{i}_audio_url", "")
+            row_data.append(answers.get(f"q{i}_speech", ""))
+            row_data.append(answers.get(f"q{i}_eval", ""))
+            row_data.append(answers.get(f"q{i}_audio_url", ""))
         else:
-            row_data[f"Q{i}_Speech"] = ""
-            row_data[f"Q{i}_Eval"] = ""
-            row_data[f"Q{i}_Audio_Link"] = ""
+            row_data.extend(["", "", ""])
             
     try:
-        existing_df = conn.read(worksheet="Results", ttl=0)
-        new_df = pd.DataFrame([row_data])
-        updated_df = pd.concat([existing_df, new_df], ignore_index=True)
-        conn.update(worksheet="Results", data=updated_df)
+        sh = get_spreadsheet()
+        worksheet = sh.worksheet("Results")
+        worksheet.append_row(row_data)
         st.success("テスト結果がスプレッドシートに正常に保存されました。")
     except Exception as e:
         st.error(f"結果の保存中にエラーが発生しました: {e}")
 
-# --- 4. メインルーティング ---
+# --- 5. メインルーティング ---
 st.sidebar.title("メニュー")
 mode = st.sidebar.radio("画面を選択してください", ["生徒用テスト画面", "先生用管理画面"])
 
 df_config_all = load_all_config()
 
-# --- 5. 先生用管理画面 ---
+# --- 6. 先生用管理画面 ---
 if mode == "先生用管理画面":
     st.title("🛠️ 先生用管理画面 (Gemini)")
     
@@ -168,11 +185,14 @@ if mode == "先生用管理画面":
     tgt_grade = st.selectbox("学年", ["1年", "2年", "3年"], key="m_grade")
     tgt_class = st.selectbox("クラス", [f"{i}組" for i in range(1, 6)], key="m_class")
     
-    match_row = df_config_all[
-        (df_config_all['School'] == tgt_school) & 
-        (df_config_all['Grade'] == tgt_grade) & 
-        (df_config_all['Class'] == tgt_class)
-    ]
+    if not df_config_all.empty and 'School' in df_config_all.columns:
+        match_row = df_config_all[
+            (df_config_all['School'] == tgt_school) & 
+            (df_config_all['Grade'] == tgt_grade) & 
+            (df_config_all['Class'] == tgt_class)
+        ]
+    else:
+        match_row = pd.DataFrame()
     
     if not match_row.empty:
         correct_password = str(match_row.iloc[0]['Admin_Password'])
@@ -226,16 +246,21 @@ if mode == "先生用管理画面":
     elif input_password != "":
         st.error("パスワードが正しくありません。")
 
-# --- 6. 生徒用テスト画面 ---
+# --- 7. 生徒用テスト画面 ---
 else:
     st.title("🇬🇧 AI English QA Test")
     
     if not st.session_state.test_started:
         st.subheader("受験者情報を入力してください")
         
-        available_schools = sorted(list(df_config_all['School'].dropna().unique())) if not df_config_all.empty else ["〇〇中学校"]
-        available_grades = sorted(list(df_config_all['Grade'].dropna().unique())) if not df_config_all.empty else ["1年", "2年", "3年"]
-        available_classes = sorted(list(df_config_all['Class'].dropna().unique())) if not df_config_all.empty else ["1組", "2組", "3組"]
+        if not df_config_all.empty and 'School' in df_config_all.columns:
+            available_schools = sorted(list(df_config_all['School'].dropna().unique()))
+            available_grades = sorted(list(df_config_all['Grade'].dropna().unique()))
+            available_classes = sorted(list(df_config_all['Class'].dropna().unique()))
+        else:
+            available_schools = ["〇〇中学校"]
+            available_grades = ["1年", "2年", "3年"]
+            available_classes = ["1組", "2組", "3組"]
         
         school = st.selectbox("学校名", available_schools)
         grade = st.selectbox("学年", available_grades)
@@ -247,24 +272,27 @@ else:
             if name.strip() == "":
                 st.warning("受験者の氏名・ニックネームを入力してください。")
             else:
-                student_config = df_config_all[
-                    (df_config_all['School'] == school) & 
-                    (df_config_all['Grade'] == grade) & 
-                    (df_config_all['Class'] == class_num)
-                ]
-                
-                if student_config.empty:
-                    st.error("選択したクラスの設定がありません。先生画面で先に問題を作成してください。")
+                if df_config_all.empty:
+                    st.error("スプレッドシートのConfigシートからデータを読み込めませんでした。先生画面で先に問題を設定するか、シートを確認してください。")
                 else:
-                    st.session_state.student_info = {
-                        "school": school, "grade": grade, "class_num": class_num,
-                        "attend_num": attend_num, "name": name.strip(),
-                        "config": student_config.iloc[0].to_dict()
-                    }
-                    st.session_state.test_started = True
-                    st.session_state.current_q_idx = 1
-                    st.session_state.answers_cache = {}
-                    st.rerun()
+                    student_config = df_config_all[
+                        (df_config_all['School'] == school) & 
+                        (df_config_all['Grade'] == grade) & 
+                        (df_config_all['Class'] == class_num)
+                    ]
+                    
+                    if student_config.empty:
+                        st.error("選択したクラスの設定がありません。先生画面で先に問題を作成してください。")
+                    else:
+                        st.session_state.student_info = {
+                            "school": school, "grade": grade, "class_num": class_num,
+                            "attend_num": attend_num, "name": name.strip(),
+                            "config": student_config.iloc[0].to_dict()
+                        }
+                        st.session_state.test_started = True
+                        st.session_state.current_q_idx = 1
+                        st.session_state.answers_cache = {}
+                        st.rerun()
 
     else:
         student_config = st.session_state.student_info["config"]
@@ -302,7 +330,6 @@ else:
                         file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
                         audio_url = upload_to_drive(audio_bytes, file_name)
                         
-                        # Geminiに音声を直接渡し、文字起こしと採点を同時実行
                         student_speech, eval_result = analyze_and_evaluate(audio_bytes, q_text, q_criteria)
                         
                         st.session_state.answers_cache[f"q{idx}_speech"] = student_speech
