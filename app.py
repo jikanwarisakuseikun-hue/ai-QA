@@ -20,10 +20,18 @@ if "student_info" not in st.session_state:
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
 
-# Azure OpenAI クライアントの初期化
-client = AzureOpenAI(
+# 【重要】チャット用と音声用でクライアントを分離して初期化
+# チャット（gpt-4o-mini）用クライアント
+client_chat = AzureOpenAI(
     api_key=st.secrets["AZURE_OPENAI_API_KEY"],
-    api_version=st.secrets["AZURE_OPENAI_API_VERSION"],
+    api_version=st.secrets.get("AZURE_OPENAI_API_VERSION_CHAT", "2024-08-01-preview"),
+    azure_endpoint=st.secrets["AZURE_OPENAI_ENDPOINT"]
+)
+
+# 音声（TTS / Whisper）用クライアント
+client_audio = AzureOpenAI(
+    api_key=st.secrets["AZURE_OPENAI_API_KEY"],
+    api_version=st.secrets.get("AZURE_OPENAI_API_VERSION_AUDIO", "2024-02-15-preview"),
     azure_endpoint=st.secrets["AZURE_OPENAI_ENDPOINT"]
 )
 
@@ -38,8 +46,8 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 def generate_ai_voice(text: str):
     """【Azure OpenAI】TTS APIで質問テキストを音声に変換"""
     try:
-        response = client.audio.speech.create(
-            model=st.secrets["AZURE_DEPLOYMENT_TTS"], # AzureのTTSデプロイ名
+        response = client_audio.audio.speech.create(
+            model=st.secrets["AZURE_DEPLOYMENT_TTS"], # AzureのTTSデプロブ名
             voice="alloy",
             input=text
         )
@@ -53,7 +61,7 @@ def transcribe_audio(audio_bytes) -> str:
     try:
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = "speech.wav"
-        transcript = client.audio.transcriptions.create(
+        transcript = client_audio.audio.transcriptions.create(
             model=st.secrets["AZURE_DEPLOYMENT_WHISPER"], # AzureのWhisperデプロイ名
             file=audio_file
         )
@@ -74,8 +82,8 @@ def evaluate_speech(student_text: str, question_text: str, criteria: str) -> str
         
         上記基準に基づき、判定（A/B/C）と、生徒への優しいアドバイス（日本語）を出力してください。
         """
-        response = client.chat.completions.create(
-            model=st.secrets["AZURE_DEPLOYMENT_CHAT"], # AzureのChatデプロイ名 (例: gpt-4o-mini)
+        response = client_chat.chat.completions.create(
+            model=st.secrets["AZURE_DEPLOYMENT_CHAT"], # AzureのChatデプロイ名
             messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content
@@ -223,7 +231,7 @@ else:
     if not st.session_state.test_started:
         st.subheader("受験者情報を入力してください")
         
-        # 💡 Configシートに存在する学校名・学年・クラスを一意に取得してプルダウンの選択肢にする
+        # Configシートに存在する学校名・学年・クラスを一意に取得してプルダウンの選択肢にする
         available_schools = sorted(list(df_config_all['School'].dropna().unique())) if not df_config_all.empty else ["〇〇中学校"]
         available_grades = sorted(list(df_config_all['Grade'].dropna().unique())) if not df_config_all.empty else ["1年", "2年", "3年"]
         available_classes = sorted(list(df_config_all['Class'].dropna().unique())) if not df_config_all.empty else ["1組", "2組", "3組"]
@@ -232,7 +240,7 @@ else:
         grade = st.selectbox("学年", available_grades)
         class_num = st.selectbox("クラス", available_classes)
         
-        # 💡 出席番号を1〜50のプルダウン（セレクトボックス）形式に変更
+        # 出席番号を1〜50のプルダウン形式に変更
         attend_num = st.selectbox("出席番号", [i for i in range(1, 51)], index=0)
         
         name = st.text_input("氏名")
