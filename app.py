@@ -113,7 +113,6 @@ def upload_to_drive(audio_bytes, file_name) -> str:
         file_metadata = {'name': file_name, 'parents': [GOOGLE_DRIVE_FOLDER_ID]}
         media = MediaIoBaseUpload(io.BytesIO(audio_bytes), mimetype='audio/wav', resumable=True)
         
-        # 【最重要】supportsAllDrives=True を追加し、共有ドライブ内のフォルダを正しく認識・書き込み可能にします
         file = drive_service.files().create(
             body=file_metadata, 
             media_body=media, 
@@ -137,17 +136,6 @@ def load_all_config():
     except Exception as e:
         st.error(f"Configシートの読み込みに失敗しました: {e}")
         return pd.DataFrame()
-
-def save_all_config(df_config):
-    """Configシート全体を上書き保存"""
-    try:
-        sh = get_spreadsheet()
-        worksheet = sh.worksheet("Config")
-        worksheet.clear()
-        string_data = df_config.astype(str).values.tolist()
-        worksheet.update([df_config.columns.values.tolist()] + string_data)
-    except Exception as e:
-        st.error(f"Configシートの更新に失敗しました: {e}")
 
 def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int):
     """Resultsシートへデータを追記"""
@@ -176,200 +164,130 @@ def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int)
     except Exception as e:
         st.error(f"結果の保存中にエラーが発生しました: {e}")
 
-# --- 5. メインルーティング ---
-st.sidebar.title("メニュー")
-mode = st.sidebar.radio("画面を選択してください", ["生徒用テスト画面", "先生用管理画面"])
+# --- 5. メイン処理（生徒用画面のみ） ---
+st.title("🇬🇧 AI English QA Test")
 
 df_config_all = load_all_config()
 
-# --- 6. 先生用管理画面 ---
-if mode == "先生用管理画面":
-    st.title("🛠️ 先生用管理画面 (Gemini)")
-    
-    st.subheader("設定対象のクラスを選択してください")
-    tgt_school = st.text_input("学校名", value="〇〇中学校")
-    tgt_grade = st.selectbox("学年", ["1年", "2年", "3年"], key="m_grade")
-    tgt_class = st.selectbox("クラス", [f"{i}組" for i in range(1, 6)], key="m_class")
+if not st.session_state.test_started:
+    st.subheader("受験者情報を入力してください")
     
     if not df_config_all.empty and 'School' in df_config_all.columns:
         df_config_all = df_config_all.astype(str)
-        match_row = df_config_all[
-            (df_config_all['School'] == str(tgt_school)) & 
-            (df_config_all['Grade'] == str(tgt_grade)) & 
-            (df_config_all['Class'] == str(tgt_class))
-        ]
+        available_schools = sorted(list(df_config_all['School'].dropna().unique()))
+        available_grades = sorted(list(df_config_all['Grade'].dropna().unique()))
+        available_classes = sorted(list(df_config_all['Class'].dropna().unique()))
     else:
-        match_row = pd.DataFrame()
+        available_schools = ["〇〇中学校"]
+        available_grades = ["1年", "2年", "3年"]
+        available_classes = ["1組", "2組", "3組"]
     
-    if not match_row.empty:
-        correct_password = str(match_row.iloc[0]['Admin_Password'])
-        current_config = match_row.iloc[0].to_dict()
-    else:
-        correct_password = "password123"
-        current_config = {"num_questions": 3}
-        
-    input_password = st.text_input("このクラスの設定用パスワードを入力してください", type="password")
+    school = st.selectbox("学校名", available_schools)
+    grade = st.selectbox("学年", available_grades)
+    class_num = st.selectbox("クラス", available_classes)
+    attend_num = st.selectbox("出席番号", [i for i in range(1, 51)], index=0)
+    name = st.text_input("氏名（例：タロウ / ニックネームなど個人が特定できないもの）")
     
-    if input_password == correct_password:
-        st.success(f"🔓 認証成功: {tgt_school} {tgt_grade}{tgt_class} 設定画面")
-        st.markdown("---")
-        
-        new_password = st.text_input("管理用パスワード", value=correct_password)
-        
-        try:
-            init_num = int(current_config.get("num_questions", 3))
-        except:
-            init_num = 3
-        new_num = st.selectbox("質問数", options=[1, 2, 3, 4, 5], index=init_num-1)
-        
-        updated_row_dict = {
-            "School": str(tgt_school), "Grade": str(tgt_grade), "Class": str(tgt_class),
-            "Admin_Password": str(new_password), "num_questions": str(new_num)
-        }
-        
-        for i in range(1, 6):
-            if i <= new_num:
-                st.markdown(f"##### 📋 質問 {i}")
-                def_text = current_config.get(f"q{i}_text", f"Question {i}?") if not match_row.empty else f"Question {i}?"
-                def_crit = current_config.get(f"q{i}_criteria", "正しく答えられているか。") if not match_row.empty else "判定基準を入力"
-                
-                updated_row_dict[f"q{i}_text"] = str(st.text_input(f"Q{i} 英語テキスト", value=def_text, key=f"t_{i}"))
-                updated_row_dict[f"q{i}_criteria"] = str(st.text_area(f"Q{i} 評価基準", value=def_crit, key=f"c_{i}"))
-            else:
-                updated_row_dict[f"q{i}_text"] = ""
-                updated_row_dict[f"q{i}_criteria"] = ""
-                
-        if st.button("このクラスの設定を保存・更新する", type="primary"):
-            with st.spinner("スプレッドシートを更新中..."):
-                if not match_row.empty:
-                    df_config_all = df_config_all.drop(match_row.index)
-                new_row_df = pd.DataFrame([updated_row_dict])
-                df_config_all = pd.concat([df_config_all, new_row_df], ignore_index=True)
-                
-                save_all_config(df_config_all)
-            st.success("設定を更新しました！")
-            st.rerun()
-            
-    elif input_password != "":
-        st.error("パスワードが正しくありません。")
-
-# --- 7. 生徒用テスト画面 ---
-else:
-    st.title("🇬🇧 AI English QA Test")
-    
-    if not st.session_state.test_started:
-        st.subheader("受験者情報を入力してください")
-        
-        if not df_config_all.empty and 'School' in df_config_all.columns:
-            df_config_all = df_config_all.astype(str)
-            available_schools = sorted(list(df_config_all['School'].dropna().unique()))
-            available_grades = sorted(list(df_config_all['Grade'].dropna().unique()))
-            available_classes = sorted(list(df_config_all['Class'].dropna().unique()))
+    if st.button("テストを始める", type="primary"):
+        if name.strip() == "":
+            st.warning("受験者の氏名・ニックネームを入力してください。")
         else:
-            available_schools = ["〇〇中学校"]
-            available_grades = ["1年", "2年", "3年"]
-            available_classes = ["1組", "2組", "3組"]
-        
-        school = st.selectbox("学校名", available_schools)
-        grade = st.selectbox("学年", available_grades)
-        class_num = st.selectbox("クラス", available_classes)
-        attend_num = st.selectbox("出席番号", [i for i in range(1, 51)], index=0)
-        name = st.text_input("氏名（例：タロウ / ニックネームなど個人が特定できないもの）")
-        
-        if st.button("テストを始める", type="primary"):
-            if name.strip() == "":
-                st.warning("受験者の氏名・ニックネームを入力してください。")
+            if df_config_all.empty:
+                st.error("スプレッドシートのConfigシートからデータを読み込めませんでした。シートの設定を確認してください。")
             else:
-                if df_config_all.empty:
-                    st.error("スプレッドシートのConfigシートからデータを読み込めませんでした。先生画面で先に問題を設定するか、シートを確認してください。")
+                df_config_all = df_config_all.astype(str)
+                student_config = df_config_all[
+                    (df_config_all['School'] == str(school)) & 
+                    (df_config_all['Grade'] == str(grade)) & 
+                    (df_config_all['Class'] == str(class_num))
+                ]
+                
+                if student_config.empty:
+                    st.error("選択したクラスの設定がスプレッドシート内に見つかりません。シートを確認してください。")
                 else:
-                    df_config_all = df_config_all.astype(str)
-                    student_config = df_config_all[
-                        (df_config_all['School'] == str(school)) & 
-                        (df_config_all['Grade'] == str(grade)) & 
-                        (df_config_all['Class'] == str(class_num))
-                    ]
-                    
-                    if student_config.empty:
-                        st.error("選択したクラスの設定がありません。先生画面で先に問題を作成してください。")
-                    else:
-                        st.session_state.student_info = {
-                            "school": str(school), 
-                            "grade": str(grade), 
-                            "class_num": str(class_num),
-                            "attend_num": str(attend_num), 
-                            "name": str(name.strip()),
-                            "config": student_config.iloc[0].to_dict()
-                        }
-                        st.session_state.test_started = True
-                        st.session_state.current_q_idx = 1
-                        st.session_state.answers_cache = {}
-                        st.rerun()
-
-    else:
-        student_config = st.session_state.student_info["config"]
-        num_questions = int(student_config.get("num_questions", 3))
-        idx = st.session_state.current_q_idx
-        
-        if idx <= num_questions:
-            st.markdown(f"### 🚀 Question {idx} / {num_questions}")
-            q_text = student_config.get(f"q{idx}_text", "")
-            q_criteria = student_config.get(f"q{idx}_criteria", "")
-            
-            voice_key = f"ai_voice_{idx}"
-            if voice_key not in st.session_state:
-                with st.spinner("AIが質問音声を生成しています... 🎧"):
-                    st.session_state[voice_key] = generate_ai_voice(q_text)
-            
-            st.markdown("#### 🎧 1. AIの質問を聴いてください")
-            if st.session_state[voice_key]:
-                st.audio(st.session_state[voice_key], format="audio/mp3")
-            
-            st.markdown("---")
-            st.markdown("#### 🗣️ 2. あなたの回答を録音してください")
-            audio_file = st.audio_input("ここを押して発話・録音", key=f"audio_{idx}")
-            
-            if st.button("回答を送信して次へ進む", type="primary", key=f"submit_{idx}"):
-                if audio_file is None:
-                    st.warning("音声が録音されていません。")
-                else:
-                    with st.spinner("Geminiが音声を直接分析し、採点を行っています..."):
-                        audio_bytes = audio_file.read()
-                        info = st.session_state.student_info
-                        
-                        file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
-                        audio_url = upload_to_drive(audio_bytes, file_name)
-                        
-                        student_speech, eval_result = analyze_and_evaluate(audio_bytes, q_text, q_criteria)
-                        
-                        st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
-                        st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
-                        st.session_state.answers_cache[f"q{idx}_audio_url"] = str(audio_url)
-                        
-                    st.session_state.current_q_idx += 1
+                    st.session_state.student_info = {
+                        "school": str(school), 
+                        "grade": str(grade), 
+                        "class_num": str(class_num),
+                        "attend_num": str(attend_num), 
+                        "name": str(name.strip()),
+                        "config": student_config.iloc[0].to_dict()
+                    }
+                    st.session_state.test_started = True
+                    st.session_state.current_q_idx = 1
+                    st.session_state.answers_cache = {}
                     st.rerun()
-                    
-        else:
-            st.balloons()
-            st.success("🎉 すべての質問が終了しました！お疲れ様でした。")
-            st.write("データを先生に送信しています。画面を閉じずにそのままお待ちください...")
-            
-            if "data_saved" not in st.session_state:
-                with st.spinner("保存中..."):
-                    save_results_to_sheet(
-                        st.session_state.student_info,
-                        st.session_state.answers_cache,
-                        num_questions
-                    )
-                st.session_state.data_saved = True
-                
-            st.markdown("---")
-            if st.button("最初の画面に戻る（次の生徒の受験用）"):
-                for key in list(st.session_state.keys()):
-                    del st.session_state[key]
-                st.rerun()
 
-# --- 8. 著作権表示（フッター） ---
+else:
+    student_config = st.session_state.student_info["config"]
+    
+    # 質問数を安全に数値（int）へ変換
+    try:
+        num_questions = int(float(student_config.get("num_questions", 3)))
+    except:
+        num_questions = 3
+        
+    idx = st.session_state.current_q_idx
+    
+    if idx <= num_questions:
+        st.markdown(f"### 🚀 Question {idx} / {num_questions}")
+        q_text = student_config.get(f"q{idx}_text", "")
+        q_criteria = student_config.get(f"q{idx}_criteria", "")
+        
+        voice_key = f"ai_voice_{idx}"
+        if voice_key not in st.session_state:
+            with st.spinner("AIが質問音声を生成しています... 🎧"):
+                st.session_state[voice_key] = generate_ai_voice(q_text)
+        
+        st.markdown("#### 🎧 1. AIの質問を聴いてください")
+        if st.session_state[voice_key]:
+            st.audio(st.session_state[voice_key], format="audio/mp3")
+        
+        st.markdown("---")
+        st.markdown("#### 🗣️ 2. あなたの回答を録音してください")
+        audio_file = st.audio_input("ここを押して発話・録音", key=f"audio_{idx}")
+        
+        if st.button("回答を送信して次へ進む", type="primary", key=f"submit_{idx}"):
+            if audio_file is None:
+                st.warning("音声が録音されていません。")
+            else:
+                with st.spinner("Geminiが音声を直接分析し、採点を行っています..."):
+                    audio_bytes = audio_file.read()
+                    info = st.session_state.student_info
+                    
+                    file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
+                    audio_url = upload_to_drive(audio_bytes, file_name)
+                    
+                    student_speech, eval_result = analyze_and_evaluate(audio_bytes, q_text, q_criteria)
+                    
+                    st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
+                    st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
+                    st.session_state.answers_cache[f"q{idx}_audio_url"] = str(audio_url)
+                    
+                st.session_state.current_q_idx += 1
+                st.rerun()
+                
+    else:
+        st.balloons()
+        st.success("🎉 すべての質問が終了しました！お疲れ様でした。")
+        st.write("データを先生に送信しています。画面を閉じずにそのままお待ちください...")
+        
+        if "data_saved" not in st.session_state:
+            with st.spinner("保存中..."):
+                save_results_to_sheet(
+                    st.session_state.student_info,
+                    st.session_state.answers_cache,
+                    num_questions
+                )
+            st.session_state.data_saved = True
+            
+        st.markdown("---")
+        if st.button("最初の画面に戻る（次の生徒の受験用）"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+# --- 6. 著作権表示（フッター） ---
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #888888; font-size: 0.8em;'>"
