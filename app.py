@@ -22,9 +22,9 @@ if "student_info" not in st.session_state:
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
 if "start_time" not in st.session_state:
-    st.session_state.start_time = None  # 各質問の開始時刻
+    st.session_state.start_time = None
 if "time_records" not in st.session_state:
-    st.session_state.time_records = {}  # 各質問の解答時間を記録
+    st.session_state.time_records = {}
 if "current_feedback" not in st.session_state:
     st.session_state.current_feedback = None
 
@@ -145,25 +145,31 @@ def load_all_config():
         return pd.DataFrame()
 
 def save_results_to_sheet(student_info: dict, answers: dict, time_records: dict, num_questions: int):
-    """Resultsシートへデータを追記 (解答時間カラムに対応)"""
+    """Resultsシートへデータを追記"""
+    # 【タイムスタンプJST強制修正】
+    # サーバーの環境に依存せず、タイムゾーンに+9時間を指定して東京（日本）の時間を取得します
+    t_delta = datetime.timedelta(hours=9)
+    JST = datetime.timezone(t_delta, 'JST')
+    now_jst = datetime.datetime.now(JST)
+    timestamp_str = now_jst.strftime("%Y-%m-%d %H:%M:%S")
+
     row_data = [
-        str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        str(student_info.get("school", "")),
-        str(student_info.get("grade", "")),
-        str(student_info.get("class_num", "")),
-        str(student_info.get("attend_num", "")),
-        str(student_info.get("name", "")),
+        str(timestamp_str),                                        # Timestamp (日本時間)
+        str(student_info.get("school", "")),                       # School
+        str(student_info.get("grade", "")),                        # Grade
+        str(student_info.get("class_num", "")),                    # Class
+        str(student_info.get("attend_num", "")),                   # Number
+        str(student_info.get("name", "")),                         # Name
     ]
     
-    # 各Questionごとに「文字起こし」「評価」「音声リンク」「解答時間」の4つをセットで追加
     for i in range(1, 6):
         if i <= num_questions:
             row_data.append(str(answers.get(f"q{i}_speech", "")))
             row_data.append(str(answers.get(f"q{i}_eval", "")))
             row_data.append(str(answers.get(f"q{i}_audio_url", "")))
-            row_data.append(str(time_records.get(i, 0)))  # 解答時間(秒)を追加
+            row_data.append(str(time_records.get(i, 0))) 
         else:
-            row_data.extend(["", "", "", ""])
+            row_data.extend(["", "", "", ""]) 
             
     try:
         sh = get_spreadsheet()
@@ -226,7 +232,7 @@ if not st.session_state.test_started:
                     st.session_state.current_q_idx = 1
                     st.session_state.answers_cache = {}
                     st.session_state.time_records = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-                    st.session_state.start_time = None  # 初期化
+                    st.session_state.start_time = None
                     st.session_state.current_feedback = None
                     st.rerun()
 
@@ -245,7 +251,6 @@ else:
         q_text = student_config.get(f"q{idx}_text", "")
         q_criteria = student_config.get(f"q{idx}_criteria", "")
         
-        # 質問画面がロードされた瞬間の時刻を記録（1回だけ設定）
         if st.session_state.start_time is None:
             st.session_state.start_time = time.time()
             
@@ -254,13 +259,9 @@ else:
             with st.spinner("AIが質問音声を生成しています... 🎧"):
                 st.session_state[voice_key] = generate_ai_voice(q_text)
         
-        st.markdown("#### 🎧 1. AIの質問を聴いてください")
+        st.markdown("#### 🎧 1. AI的質問を聴いてください")
         if st.session_state[voice_key]:
             st.audio(st.session_state[voice_key], format="audio/mp3")
-        
-        # 経過時間を計算してリアルタイム表示
-        elapsed_time = int(time.time() - st.session_state.start_time)
-        st.caption(f"⏱️ この問題の経過時間: **{elapsed_time}秒**")
         
         st.markdown("---")
         st.markdown("#### 🗣️ 2. あなたの回答を録音してください")
@@ -272,7 +273,6 @@ else:
                 if audio_file is None:
                     st.warning("音声が録音されていません。")
                 else:
-                    # 送信された瞬間に解答時間を確定
                     final_elapsed = int(time.time() - st.session_state.start_time)
                     st.session_state.time_records[idx] = final_elapsed
                     
@@ -305,13 +305,12 @@ else:
                 st.markdown("#### 📝 採点・アドバイス")
                 st.info(st.session_state.current_feedback["eval"])
                 
-                # 解答時間をフィードバックエリアにもおまけ表示
                 st.write(f"⏱️ かかった時間: **{st.session_state.time_records[idx]}秒**")
             
             st.markdown("確認したら、下のボタンを押して次の問題に進んでください。")
             if st.button("次の質問へ進む ➡️", type="primary", key=f"next_btn_{idx}"):
                 st.session_state.current_feedback = None
-                st.session_state.start_time = None  # 次の問題のためにタイマーリセット
+                st.session_state.start_time = None 
                 st.session_state.current_q_idx += 1
                 st.rerun()
                 
