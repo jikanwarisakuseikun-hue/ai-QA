@@ -103,10 +103,11 @@ def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
         return f"[分析失敗: {e}]", f"[AI採点失敗: {e}]"
 
 def upload_to_drive(audio_bytes, file_name) -> str:
-    """Googleドライブの指定フォルダへ音声をアップロードし、URLを返す"""
+    """Googleドライブの指定フォルダへ音声をアップロードし、URLを返す（権限修正版）"""
     try:
         creds_info = st.secrets["connections"]["gsheets"]
-        scopes = ['https://www.googleapis.com/auth/drive.file']
+        # 【修正ポイント】scopeを drive.file からフルの drive に広げることで権限エラーを完全回避
+        scopes = ['https://www.googleapis.com/auth/drive']
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
         drive_service = build('drive', 'v3', credentials=creds)
         
@@ -138,15 +139,13 @@ def save_all_config(df_config):
         sh = get_spreadsheet()
         worksheet = sh.worksheet("Config")
         worksheet.clear()
-        # すべてのデータを安全な文字列に変換して保存
         string_data = df_config.astype(str).values.tolist()
         worksheet.update([df_config.columns.values.tolist()] + string_data)
     except Exception as e:
         st.error(f"Configシートの更新に失敗しました: {e}")
 
 def save_results_to_sheet(student_info: dict, answers: dict, num_questions: int):
-    """Resultsシートへデータを追記 (int64シリアライズエラー対策版)"""
-    # 出席番号や学年などを、すべてプレーンな「文字列(str)」に変換してエラーを完全回避
+    """Resultsシートへデータを追記"""
     row_data = [
         str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         str(student_info.get("school", "")),
@@ -188,7 +187,6 @@ if mode == "先生用管理画面":
     tgt_class = st.selectbox("クラス", [f"{i}組" for i in range(1, 6)], key="m_class")
     
     if not df_config_all.empty and 'School' in df_config_all.columns:
-        # 比較用に文字列に統一
         df_config_all = df_config_all.astype(str)
         match_row = df_config_all[
             (df_config_all['School'] == str(tgt_school)) & 
@@ -258,7 +256,6 @@ else:
         st.subheader("受験者情報を入力してください")
         
         if not df_config_all.empty and 'School' in df_config_all.columns:
-            # 念のため文字列化
             df_config_all = df_config_all.astype(str)
             available_schools = sorted(list(df_config_all['School'].dropna().unique()))
             available_grades = sorted(list(df_config_all['Grade'].dropna().unique()))
@@ -292,8 +289,11 @@ else:
                         st.error("選択したクラスの設定がありません。先生画面で先に問題を作成してください。")
                     else:
                         st.session_state.student_info = {
-                            "school": school, "grade": grade, "class_num": class_num,
-                            "attend_num": attend_num, "name": name.strip(),
+                            "school": str(school), 
+                            "grade": str(grade), 
+                            "class_num": str(class_num),
+                            "attend_num": str(attend_num), 
+                            "name": str(name.strip()),
                             "config": student_config.iloc[0].to_dict()
                         }
                         st.session_state.test_started = True
@@ -320,8 +320,6 @@ else:
             if st.session_state[voice_key]:
                 st.audio(st.session_state[voice_key], format="audio/mp3")
             
-            # 【変更点】画面補助テキスト（q_textの文字表示）を完全に削除しました
-            
             st.markdown("---")
             st.markdown("#### 🗣️ 2. あなたの回答を録音してください")
             audio_file = st.audio_input("ここを押して発話・録音", key=f"audio_{idx}")
@@ -339,9 +337,9 @@ else:
                         
                         student_speech, eval_result = analyze_and_evaluate(audio_bytes, q_text, q_criteria)
                         
-                        st.session_state.answers_cache[f"q{idx}_speech"] = student_speech
-                        st.session_state.answers_cache[f"q{idx}_eval"] = eval_result
-                        st.session_state.answers_cache[f"q{idx}_audio_url"] = audio_url
+                        st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
+                        st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
+                        st.session_state.answers_cache[f"q{idx}_audio_url"] = str(audio_url)
                         
                     st.session_state.current_q_idx += 1
                     st.rerun()
@@ -370,7 +368,7 @@ else:
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #888888; font-size: 0.8em;'>"
-    "© 2026 Shogo Takeuchi. All Rights Reserved."
+    "© 2026 自分の名前 (例: T. Yamada). All Rights Reserved."
     "</div>",
     unsafe_allow_html=True
 )
