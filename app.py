@@ -3,13 +3,13 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import datetime
 import io
-from openai import OpenAI
+from openai import AzureOpenAI
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2 import service_account
 
 # --- 1. ページ基本設定 & セッション状態の初期化 ---
-st.set_page_config(page_title="AI英語QAテスト", page_icon="🇬🇧", layout="centered")
+st.set_page_config(page_title="AI英語QAテスト (Azure)", page_icon="🇬🇧", layout="centered")
 
 if "test_started" not in st.session_state:
     st.session_state.test_started = False
@@ -20,20 +20,26 @@ if "student_info" not in st.session_state:
 if "answers_cache" not in st.session_state:
     st.session_state.answers_cache = {}
 
-# クライアント・接続の初期化 (Secretsから自動取得)
-conn = st.connection("gsheets", type=GSheetsConnection)
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+# Azure OpenAI クライアントの初期化
+client = AzureOpenAI(
+    api_key=st.secrets["AZURE_OPENAI_API_KEY"],
+    api_version=st.secrets["AZURE_OPENAI_API_VERSION"],
+    azure_endpoint=st.secrets["AZURE_OPENAI_ENDPOINT"]
+)
 
 # Googleドライブの保存先フォルダID
 GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
 
-# --- 2. 各種外部API連携・処理関数 ---
+# スプレッドシート接続
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+# --- 2. Azure OpenAI 連携関数 ---
 
 def generate_ai_voice(text: str):
-    """OpenAI TTS APIで質問テキストを音声に変換"""
+    """【Azure OpenAI】TTS APIで質問テキストを音声に変換"""
     try:
         response = client.audio.speech.create(
-            model="tts-1",
+            model=st.secrets["AZURE_DEPLOYMENT_TTS"], # AzureのTTSデプロイ名
             voice="alloy",
             input=text
         )
@@ -43,13 +49,12 @@ def generate_ai_voice(text: str):
         return None
 
 def transcribe_audio(audio_bytes) -> str:
-    """【既存コード移植エリア】Whisperでの文字起こし処理"""
+    """【Azure OpenAI】Whisperでの文字起こし処理"""
     try:
-        # st.audio_inputのデータをファイルオブジェクト化してWhisperに投入
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = "speech.wav"
         transcript = client.audio.transcriptions.create(
-            model="whisper-1", 
+            model=st.secrets["AZURE_DEPLOYMENT_WHISPER"], # AzureのWhisperデプロイ名
             file=audio_file
         )
         return transcript.text
@@ -57,7 +62,7 @@ def transcribe_audio(audio_bytes) -> str:
         return f"[文字起こし失敗: {e}]"
 
 def evaluate_speech(student_text: str, question_text: str, criteria: str) -> str:
-    """【既存コード移植エリア】ChatGPTによる文法チェック・採点"""
+    """【Azure OpenAI】ChatGPTによる文法チェック・採点"""
     try:
         prompt = f"""
         あなたは中学校の英語教師です。生徒の回答を採点・評価してください。
@@ -70,7 +75,7 @@ def evaluate_speech(student_text: str, question_text: str, criteria: str) -> str
         上記基準に基づき、判定（A/B/C）と、生徒への優しいアドバイス（日本語）を出力してください。
         """
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=st.secrets["AZURE_DEPLOYMENT_CHAT"], # AzureのChatデプロイ名 (例: gpt-4o-mini)
             messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content
@@ -80,7 +85,6 @@ def evaluate_speech(student_text: str, question_text: str, criteria: str) -> str
 def upload_to_drive(audio_bytes, file_name) -> str:
     """Googleドライブの指定フォルダへ音声をアップロードし、URLを返す"""
     try:
-        # GSheetsと同一の認証情報を使い回してDrive APIを呼び出す
         creds_info = st.secrets["connections"]["gsheets"]
         scopes = ['https://www.googleapis.com/auth/drive.file']
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
@@ -145,7 +149,7 @@ df_config_all = load_all_config()
 
 # --- 5. 先生用管理画面 ---
 if mode == "先生用管理画面":
-    st.title("🛠️ 先生用管理画面")
+    st.title("🛠️ 先生用管理画面 (Azure)")
     
     st.subheader("設定対象のクラスを選択してください")
     tgt_school = st.text_input("学校名", value="〇〇中学校")
@@ -159,12 +163,11 @@ if mode == "先生用管理画面":
         (df_config_all['Class'] == tgt_class)
     ]
     
-    # 該当クラス行の有無に応じたパスワード取得と初期値設定
     if not match_row.empty:
         correct_password = str(match_row.iloc[0]['Admin_Password'])
         current_config = match_row.iloc[0].to_dict()
     else:
-        correct_password = "password123"  # 新規クラスの場合のデフォルト
+        correct_password = "password123"  # 新規登録時のデフォルトパスワード
         current_config = {"num_questions": 3}
         
     input_password = st.text_input("このクラスの設定用パスワードを入力してください", type="password")
@@ -173,16 +176,15 @@ if mode == "先生用管理画面":
         st.success(f"🔓 認証成功: {tgt_school} {tgt_grade}{tgt_class} 設定画面")
         st.markdown("---")
         
-        new_password = st.text_input("管理用パスワード（変更する場合のみ書き換え）", value=correct_password)
+        new_password = st.text_input("管理用パスワード（スプレッドシート内を上書き変更）", value=correct_password)
         
-        # 質問数設定 (1〜5)
         try:
             init_num = int(current_config.get("num_questions", 3))
         except:
             init_num = 3
         new_num = st.selectbox("質問数", options=[1, 2, 3, 4, 5], index=init_num-1)
         
-        # 動的入力フォームの生成
+        # 保存データの土台作成
         updated_row_dict = {
             "School": tgt_school, "Grade": tgt_grade, "Class": tgt_class,
             "Admin_Password": new_password, "num_questions": new_num
@@ -191,25 +193,24 @@ if mode == "先生用管理画面":
         for i in range(1, 6):
             if i <= new_num:
                 st.markdown(f"##### 📋 質問 {i}")
-                def_text = current_config.get(f"q{i}_text", f"Sample Question {i}?") if not match_row.empty else f"Question {i}?"
+                def_text = current_config.get(f"q{i}_text", f"Question {i}?") if not match_row.empty else f"Question {i}?"
                 def_crit = current_config.get(f"q{i}_criteria", "正しく答えられているか。") if not match_row.empty else "判定基準を入力"
                 
                 updated_row_dict[f"q{i}_text"] = st.text_input(f"Q{i} 英語テキスト", value=def_text, key=f"t_{i}")
-                updated_row_dict[f"q{i}_criteria"] = st.text_area(f"Q{i} 評価基準（AIへの指示）", value=def_crit, key=f"c_{i}")
+                updated_row_dict[f"q{i}_criteria"] = st.text_area(f"Q{i} 評価基準", value=def_crit, key=f"c_{i}")
             else:
                 updated_row_dict[f"q{i}_text"] = ""
                 updated_row_dict[f"q{i}_criteria"] = ""
                 
         if st.button("このクラスの設定を保存・更新する", type="primary"):
             with st.spinner("スプレッドシートを更新中..."):
-                # 既存行があれば削除して新しい内容を追加、なければ純粋追加
                 if not match_row.empty:
                     df_config_all = df_config_all.drop(match_row.index)
                 new_row_df = pd.DataFrame([updated_row_dict])
                 df_config_all = pd.concat([df_config_all, new_row_df], ignore_index=True)
                 
                 save_all_config(df_config_all)
-            st.success("設定を更新しました！生徒画面に即時反映されます。")
+            st.success("設定を更新しました！")
             st.rerun()
             
     elif input_password != "":
@@ -219,7 +220,6 @@ if mode == "先生用管理画面":
 else:
     st.title("🇬🇧 AI English QA Test")
     
-    # 6-A. テスト開始前：受験者情報入力とクラス問題の紐付け
     if not st.session_state.test_started:
         st.subheader("受験者情報を入力してください")
         school = st.text_input("学校名", value="〇〇中学校")
@@ -232,7 +232,6 @@ else:
             if name.strip() == "":
                 st.warning("氏名を入力してください。")
             else:
-                # 入力されたクラスの設定を検索
                 student_config = df_config_all[
                     (df_config_all['School'] == school) & 
                     (df_config_all['Grade'] == grade) & 
@@ -240,7 +239,7 @@ else:
                 ]
                 
                 if student_config.empty:
-                    st.error("入力されたクラスのテスト設定が先生用画面で作成されていません。先生に確認してください。")
+                    st.error("選択したクラスの設定がありません。先生画面で先に問題を作成してください。")
                 else:
                     st.session_state.student_info = {
                         "school": school, "grade": grade, "class_num": class_num,
@@ -252,7 +251,6 @@ else:
                     st.session_state.answers_cache = {}
                     st.rerun()
 
-    # 6-B. テスト中：AI質問再生 ➔ 録音 ➔ 判定ループ
     else:
         student_config = st.session_state.student_info["config"]
         num_questions = int(student_config.get("num_questions", 3))
@@ -263,7 +261,6 @@ else:
             q_text = student_config.get(f"q{idx}_text", "")
             q_criteria = student_config.get(f"q{idx}_criteria", "")
             
-            # OpenAI TTSでAI音声をオンデマンド生成
             voice_key = f"ai_voice_{idx}"
             if voice_key not in st.session_state:
                 with st.spinner("AIが質問を準備しています... 🎧"):
@@ -273,7 +270,6 @@ else:
             if st.session_state[voice_key]:
                 st.audio(st.session_state[voice_key], format="audio/mp3")
             
-            # リスニング専用にしたい場合は以下の行をコメントアウト(#)にする
             st.info(f"👉 (画面補助テキスト): {q_text}")
             
             st.markdown("---")
@@ -288,15 +284,12 @@ else:
                         audio_bytes = audio_file.read()
                         info = st.session_state.student_info
                         
-                        # ファイル名定義とGoogleドライブ保存
                         file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
                         audio_url = upload_to_drive(audio_bytes, file_name)
                         
-                        # 既存ロジックによる処理
                         student_speech = transcribe_audio(audio_bytes)
                         eval_result = evaluate_speech(student_speech, q_text, q_criteria)
                         
-                        # キャッシュ保持
                         st.session_state.answers_cache[f"q{idx}_speech"] = student_speech
                         st.session_state.answers_cache[f"q{idx}_eval"] = eval_result
                         st.session_state.answers_cache[f"q{idx}_audio_url"] = audio_url
@@ -304,7 +297,6 @@ else:
                     st.session_state.current_q_idx += 1
                     st.rerun()
                     
-        # 6-C. テスト終了：Resultsシートへ一括書き込み
         else:
             st.balloons()
             st.success("🎉 すべての質問が終了しました！お疲れ様でした。")
