@@ -287,7 +287,7 @@ else:
                 with st.spinner("AIが質問音声を生成しています... 🎧"):
                     st.session_state[voice_key] = generate_ai_voice(q_text)
             
-            st.markdown("#### 🎧 1. AIの質問を聴いてください")
+            st.markdown("#### 🎧 1. AIの質問を聴してください")
             if st.session_state[voice_key]:
                 st.audio(st.session_state[voice_key], format="audio/mp3")
             
