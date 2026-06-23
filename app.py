@@ -103,10 +103,9 @@ def analyze_and_evaluate(audio_bytes, question_text: str, criteria: str):
         return f"[分析失敗: {e}]", f"[AI採点失敗: {e}]"
 
 def upload_to_drive(audio_bytes, file_name) -> str:
-    """Googleドライブの指定フォルダへ音声をアップロードし、URLを返す（権限修正版）"""
+    """Googleドライブの指定フォルダへ音声をアップロード (共有ドライブ完全対応版)"""
     try:
         creds_info = st.secrets["connections"]["gsheets"]
-        # 【修正ポイント】scopeを drive.file からフルの drive に広げることで権限エラーを完全回避
         scopes = ['https://www.googleapis.com/auth/drive']
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
         drive_service = build('drive', 'v3', credentials=creds)
@@ -114,7 +113,13 @@ def upload_to_drive(audio_bytes, file_name) -> str:
         file_metadata = {'name': file_name, 'parents': [GOOGLE_DRIVE_FOLDER_ID]}
         media = MediaIoBaseUpload(io.BytesIO(audio_bytes), mimetype='audio/wav', resumable=True)
         
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        # 【最重要】supportsAllDrives=True を追加し、共有ドライブ内のフォルダを正しく認識・書き込み可能にします
+        file = drive_service.files().create(
+            body=file_metadata, 
+            media_body=media, 
+            fields='id, webViewLink',
+            supportsAllDrives=True
+        ).execute()
         return file.get('webViewLink', '')
     except Exception as e:
         st.error(f"Googleドライブへのアップロードに失敗しました: {e}")
