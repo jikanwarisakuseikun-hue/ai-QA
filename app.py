@@ -222,10 +222,19 @@ else:
     
     if not st.session_state.test_started:
         st.subheader("受験者情報を入力してください")
-        school = st.text_input("学校名", value="〇〇中学校")
-        grade = st.selectbox("学年", ["1年", "2年", "3年"])
-        class_num = st.selectbox("クラス", [f"{i}組" for i in range(1, 6)])
-        attend_num = st.number_input("出席番号", min_value=1, max_value=50, value=1, step=1)
+        
+        # 💡 Configシートに存在する学校名・学年・クラスを一意に取得してプルダウンの選択肢にする
+        available_schools = sorted(list(df_config_all['School'].dropna().unique())) if not df_config_all.empty else ["〇〇中学校"]
+        available_grades = sorted(list(df_config_all['Grade'].dropna().unique())) if not df_config_all.empty else ["1年", "2年", "3年"]
+        available_classes = sorted(list(df_config_all['Class'].dropna().unique())) if not df_config_all.empty else ["1組", "2組", "3組"]
+        
+        school = st.selectbox("学校名", available_schools)
+        grade = st.selectbox("学年", available_grades)
+        class_num = st.selectbox("クラス", available_classes)
+        
+        # 💡 出席番号を1〜50のプルダウン（セレクトボックス）形式に変更
+        attend_num = st.selectbox("出席番号", [i for i in range(1, 51)], index=0)
+        
         name = st.text_input("氏名")
         
         if st.button("テストを始める", type="primary"):
@@ -243,7 +252,7 @@ else:
                 else:
                     st.session_state.student_info = {
                         "school": school, "grade": grade, "class_num": class_num,
-                        "attend_num": attend_num, "name": name,
+                        "attend_num": attend_num, "name": name.strip(),
                         "config": student_config.iloc[0].to_dict()
                     }
                     st.session_state.test_started = True
