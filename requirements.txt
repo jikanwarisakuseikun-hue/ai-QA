@@ -1,0 +1,6 @@
+streamlit
+st-gsheets-connection
+pandas
+openai
+google-api-python-client
+google-auth
