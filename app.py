@@ -103,6 +103,12 @@ def analyze_and_evaluate_hybrid(audio_bytes, question_text: str, criteria: str):
 
     # --- ルート②: バックアップの Gemini で実行 ---
     try:
+        # 音声データをGeminiの最新仕様に合わせて安全に型変換
+        audio_data = {
+            "mime_type": "audio/wav",
+            "data": io.BytesIO(audio_bytes).getvalue()
+        }
+
         prompt_gemini = prompt_evaluation + """
         \n添付された生徒の録音音声（英語）を聴いて、以下の2つのタスクを行ってください。
 
@@ -122,10 +128,7 @@ def analyze_and_evaluate_hybrid(audio_bytes, question_text: str, criteria: str):
         """
         
         model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content([
-            {'mime_type': 'audio/wav', 'data': audio_bytes},
-            prompt_gemini
-        ])
+        response = model.generate_content([audio_data, prompt_gemini])
         
         result_text = response.text
         student_speech_gemini = "[文字起こしの抽出に失敗しました]"
