@@ -1,4 +1,8 @@
 streamlit
-gTTS
+pandas
 google-generativeai
+groq
+gTTS
+google-api-python-client
+google-auth
 gspread
