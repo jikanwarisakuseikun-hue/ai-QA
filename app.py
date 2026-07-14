@@ -4,6 +4,7 @@ import datetime
 import io
 import time
 import os
+import random
 import google.generativeai as genai  # Gemini用
 from gtts import gTTS
 from googleapiclient.discovery import build
@@ -28,6 +29,11 @@ if "time_records" not in st.session_state:
     st.session_state.time_records = {}
 if "current_feedback" not in st.session_state:
     st.session_state.current_feedback = None
+# 考える時間（シンキングタイム）のタイマー制御用
+if "timer_done" not in st.session_state:
+    st.session_state.timer_done = False
+if "last_timer_q_idx" not in st.session_state:
+    st.session_state.last_timer_q_idx = 0
 
 # Gemini APIの初期化
 try:
@@ -55,14 +61,13 @@ def get_gspread_client():
 def get_spreadsheet():
     try:
         gc = get_gspread_client()
-        # Secrets内のスプレッドシートURLを取得
         spreadsheet_url = st.secrets["spreadsheet"]
         return gc.open_by_url(spreadsheet_url)
     except Exception as e:
-        st.error(f"⚠️ スプレッドシートのオープンに失敗しました。URLまたはアクセス権限（共有設定）を確認してください: {e}")
+        st.error(f"⚠️ スプレッドシートのオープンに失敗しました。URLまたはアクセス権限を確認してください: {e}")
         st.stop()
 
-# --- 3. AI & 音声 連携関数 (Gemini一本化仕様) ---
+# --- 3. AI & 音声 連携関数 (リトライ機能搭載) ---
 
 def generate_ai_voice(text: str):
     try:
@@ -75,10 +80,9 @@ def generate_ai_voice(text: str):
         st.error(f"AI音声の生成に失敗しました: {e}")
         return None
 
-def analyze_and_evaluate_gemini(audio_bytes, question_text: str, criteria: str):
-    """【Gemini専用評価システム】音声から文字起こしと評価を同時に実行"""
+def analyze_and_evaluate_gemini_with_retry(audio_bytes, question_text: str, criteria: str, max_retries=5):
+    """【堅牢版】同時アクセスエラー（429等）を自動リトライで回避する評価関数"""
     
-    # プロンプトの定義
     prompt_evaluation = f"""
     あなたは中学校の英語教師です。
     提示した質問・評価基準と、添付された生徒の録音音声（英語）を照らし合わせて、以下の2つのタスクを行ってください。
@@ -101,76 +105,85 @@ def analyze_and_evaluate_gemini(audio_bytes, question_text: str, criteria: str):
     アドバイス: (生徒への優しい日本語のアドバイス)
     """
 
-    # 音声データをGeminiの仕様に合わせて変換
     audio_data = {
         "mime_type": "audio/wav",
         "data": io.BytesIO(audio_bytes).getvalue()
     }
 
-    # 環境によってモデル名が拒否されないよう、自動で予備のモデルに切り替える（フォールバック）
     models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
     
-    last_error = ""
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content([audio_data, prompt_evaluation])
-            result_text = response.text
-            
-            # 初期値設定
-            student_speech = "[文字起こしの抽出に失敗しました]"
-            eval_result = result_text
-            
-            # フォーマット通りに文字起こしと評価結果を分割
-            if "■文字起こし:" in result_text and "■評価結果:" in result_text:
-                parts = result_text.split("■評価結果:")
-                eval_result = "■評価結果:" + parts[1]
-                student_speech = parts[0].replace("■文字起こし:", "").strip()
+    for attempt in range(max_retries):
+        last_error = ""
+        for model_name in models_to_try:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content([audio_data, prompt_evaluation])
+                result_text = response.text
                 
-            return student_speech, eval_result, f"🟢 Gemini ({model_name} で解析完了)"
+                student_speech = "[文字起こしの抽出に失敗しました]"
+                eval_result = result_text
+                
+                if "■文字起こし:" in result_text and "■評価結果:" in result_text:
+                    parts = result_text.split("■評価結果:")
+                    eval_result = "■評価結果:" + parts[1]
+                    student_speech = parts[0].replace("■文字起こし:", "").strip()
+                    
+                return student_speech, eval_result, f"🟢 Gemini ({model_name} で解析完了)"
+                
+            except Exception as e:
+                last_error = str(e)
+                if "429" in last_error or "Quota" in last_error or "limit" in last_error:
+                    time.sleep(1 + random.random())
+                continue
+        
+        if attempt < max_retries - 1:
+            wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+            time.sleep(wait_time)
+        else:
+            break
             
-        except Exception as e:
-            last_error = str(e)
-            continue # 次のモデル名で再試行
-            
-    # 全てのモデルが全滅した場合
     return (
-        "[エラー] AIが応答しませんでした。", 
-        f"Geminiエラー: {last_error}\nお使いの環境のライブラリバージョンやAPIキーの設定をご確認ください。", 
-        "🔴 解析失敗"
+        "[エラー] 混雑のためAIが応答しませんでした。", 
+        f"Geminiエラー: {last_error}\n時間を置いて再度送信をお試しください。", 
+        "🔴 解析失敗（制限オーバー）"
     )
 
-def upload_to_drive(audio_bytes, file_name) -> str:
-    try:
-        creds_info = st.secrets["connections"]["gsheets"]
-        scopes = ['https://www.googleapis.com/auth/drive']
-        creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
-        drive_service = build('drive', 'v3', credentials=creds)
-        
-        file_metadata = {'name': file_name, 'parents': [GOOGLE_DRIVE_FOLDER_ID]}
-        media = MediaIoBaseUpload(io.BytesIO(audio_bytes), mimetype='audio/wav', resumable=True)
-        
-        file = drive_service.files().create(
-            body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True
-        ).execute()
-        return file.get('webViewLink', '')
-    except Exception as e:
-        return f"Upload Failed: {e}"
+def upload_to_drive_with_retry(audio_bytes, file_name, max_retries=5) -> str:
+    """【堅牢版】同時書き込み制限による403/503エラーをリトライで回避するアップロード関数"""
+    for attempt in range(max_retries):
+        try:
+            creds_info = st.secrets["connections"]["gsheets"]
+            scopes = ['https://www.googleapis.com/auth/drive']
+            creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
+            drive_service = build('drive', 'v3', credentials=creds)
+            
+            file_metadata = {'name': file_name, 'parents': [GOOGLE_DRIVE_FOLDER_ID]}
+            media = MediaIoBaseUpload(io.BytesIO(audio_bytes), mimetype='audio/wav', resumable=True)
+            
+            file = drive_service.files().create(
+                body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True
+            ).execute()
+            return file.get('webViewLink', '')
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1.5 + random.random() * 1.5)
+            else:
+                return f"Upload Failed: {e}"
 
 # --- 4. スプレッドシート操作関数 ---
-@st.cache_data(ttl=60)  # テスト時の反映確認を早めるため、キャッシュ保持時間を10分から1分(60秒)に短縮
+@st.cache_data(ttl=60)
 def load_all_config():
     try:
         sh = get_spreadsheet()
-        # ⚠️ シート名が「Config」であることを確認
         data = sh.worksheet("Config").get_all_records()
         return pd.DataFrame(data)
     except Exception as e:
-        # 💻 エラー発生時に詳細な原因を画面に出力するように変更
         st.error(f"⚠️ スプレッドシート「Config」シートのデータ取得に失敗しました。詳細エラー: {e}")
         return pd.DataFrame()
 
-def save_results_to_sheet(student_info: dict, answers: dict, time_records: dict, num_questions: int):
+def save_results_to_sheet_with_retry(student_info: dict, answers: dict, time_records: dict, num_questions: int, max_retries=5):
+    """【堅牢版】同時書き込みによるシート競合をリトライで解決する保存関数"""
     t_delta = datetime.timedelta(hours=9)
     JST = datetime.timezone(t_delta, 'JST')
     row_data = [
@@ -189,12 +202,19 @@ def save_results_to_sheet(student_info: dict, answers: dict, time_records: dict,
             row_data.append(str(time_records.get(i, 0))) 
         else:
             row_data.extend(["", "", "", ""]) 
-    try:
-        sh = get_spreadsheet()
-        sh.worksheet("Results").append_row(row_data)
-        st.success("結果がスプレッドシートに保存されました。")
-    except Exception as e:
-        st.error(f"保存エラー: {e}")
+            
+    for attempt in range(max_retries):
+        try:
+            sh = get_spreadsheet()
+            sh.worksheet("Results").append_row(row_data)
+            st.success("結果がスプレッドシートに保存されました。")
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 + random.random() * 2)
+            else:
+                st.error(f"保存エラー: {e}。お手数ですがこの画面をスクリーンショット等で保存し、先生に伝えてください。")
+                return False
 
 # --- 5. メイン処理 ---
 st.title("🇬🇧 AI English QA Test")
@@ -204,7 +224,6 @@ df_config_all = load_all_config()
 if not st.session_state.test_started:
     st.subheader("受験者情報を入力してください")
     
-    # 読み込んだデータが正しく取得できているか判定
     if not df_config_all.empty and 'School' in df_config_all.columns:
         df_config_all = df_config_all.astype(str)
         try:
@@ -212,11 +231,10 @@ if not st.session_state.test_started:
             available_grades = sorted(list(df_config_all['Grade'].dropna().unique()))
             available_classes = sorted(list(df_config_all['Class'].dropna().unique()))
         except Exception as e:
-            st.error(f"⚠️ 列名（School, Grade, Class）のいずれかがシートに見つかりません。列名ヘッダーのスペルを確認してください。 エラー: {e}")
+            st.error(f"⚠️ 列名（School, Grade, Class）が見つかりません: {e}")
             available_schools, available_grades, available_classes = ["〇〇中"], ["1年"], ["1組"]
     else:
-        # データが読めなかった場合の代替（デフォルト値）
-        st.warning("⚠️ スプレッドシートからデータを取得できませんでした。デフォルトの設定（〇〇中 1年 1組）で表示しています。")
+        st.warning("⚠️ スプレッドシートからデータを取得できませんでした。デフォルトの設定で表示しています。")
         available_schools, available_grades, available_classes = ["〇〇中"], ["1年"], ["1組"]
     
     school = st.selectbox("学校名", available_schools)
@@ -225,19 +243,18 @@ if not st.session_state.test_started:
     attend_num = st.selectbox("出席番号", [i for i in range(1, 51)], index=0)
     name = st.text_input("氏名（例：タロウ / ニックネーム）")
     
-    # 手動でキャッシュをクリアして再読み込みするボタンを配置
     if st.button("🔄 スプレッドシートからデータを再読込する"):
         st.cache_data.clear()
         st.rerun()
     
     if st.button("テストを始める", type="primary"):
         if name.strip() == "" or df_config_all.empty:
-            st.warning("入力内容を確認するか、上記のエラー内容を確認してConfigシートを修正してください。")
+            st.warning("入力内容を確認するか、Configシートを修正してください。")
         else:
             df_config_all = df_config_all.astype(str)
             student_config = df_config_all[(df_config_all['School'] == str(school)) & (df_config_all['Grade'] == str(grade)) & (df_config_all['Class'] == str(class_num))]
             if student_config.empty:
-                st.error("入力されたクラス設定（School, Grade, Classの組み合わせ）がConfigシートに見つかりません。")
+                st.error("入力されたクラス設定がConfigシートに見つかりません。")
             else:
                 st.session_state.student_info = {"school": school, "grade": grade, "class_num": class_num, "attend_num": attend_num, "name": name.strip(), "config": student_config.iloc[0].to_dict()}
                 st.session_state.test_started = True
@@ -245,6 +262,8 @@ if not st.session_state.test_started:
                 st.session_state.answers_cache = {}
                 st.session_state.time_records = {1:0, 2:0, 3:0, 4:0, 5:0}
                 st.session_state.current_feedback = None
+                st.session_state.timer_done = False
+                st.session_state.last_timer_q_idx = 0
                 st.rerun()
 else:
     student_config = st.session_state.student_info["config"]
@@ -268,52 +287,76 @@ else:
             st.audio(st.session_state[voice_key], format="audio/mp3")
         
         st.markdown("---")
-        st.markdown("#### 🗣️ 2. あなたの回答を録音してください")
         
-        if st.session_state.current_feedback is None:
-            audio_file = st.audio_input("ここを押して発話・録音", key=f"audio_{idx}")
+        # --- ⏳ シンキングタイム・カウントダウン機能 ---
+        # 該当設問でまだタイマーを実行していなければ処理を開始
+        if st.session_state.last_timer_q_idx != idx:
+            st.markdown("#### 🧠 2. 答える英語を考えてください（シンキングタイム）")
+            # 20秒の考える時間（学校現場に合わせた秒数。必要に応じて変更してください）
+            thinking_seconds = 20 
             
-            if st.button("回答を送信する", type="primary", key=f"submit_{idx}"):
-                if audio_file is None:
-                    st.warning("音声が録音されていません。")
-                else:
-                    st.session_state.time_records[idx] = int(time.time() - st.session_state.start_time)
-                    with st.spinner("AIがあなたの英語を分析中... 📝"):
-                        audio_bytes = audio_file.read()
-                        info = st.session_state.student_info
-                        file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
-                        audio_url = upload_to_drive(audio_bytes, file_name)
-                        
-                        # Gemini評価関数を実行
-                        student_speech, eval_result, system_status = analyze_and_evaluate_gemini(audio_bytes, q_text, q_criteria)
-                        
-                        st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
-                        st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
-                        st.session_state.answers_cache[f"q{idx}_audio_url"] = str(audio_url)
-                        
-                        st.session_state.current_feedback = {"speech": student_speech, "eval": eval_result, "status": system_status}
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            
+            for percent_complete in range(thinking_seconds):
+                time.sleep(1)
+                progress_bar.progress((percent_complete + 1) / thinking_seconds)
+                status_text.write(f"⏳ あと **{thinking_seconds - (percent_complete + 1)}** 秒考えてください...")
+            
+            status_text.write("✅ 考える時間が終了しました！録音を開始しましょう。")
+            st.session_state.timer_done = True
+            st.session_state.last_timer_q_idx = idx
+            time.sleep(0.5)
+            st.rerun()
+
+        # タイマー完了後にのみ表示される「発話・録音エリア」
+        if st.session_state.timer_done:
+            st.markdown("#### 🗣️ 3. あなたの回答を録音してください")
+            
+            if st.session_state.current_feedback is None:
+                audio_file = st.audio_input("ここを押して発話・録音", key=f"audio_{idx}")
+                
+                if st.button("回答を送信する", type="primary", key=f"submit_{idx}"):
+                    if audio_file is None:
+                        st.warning("音声が録音されていません。")
+                    else:
+                        st.session_state.time_records[idx] = int(time.time() - st.session_state.start_time)
+                        with st.spinner("AIがあなたの英語を分析中... 📝 (※混雑時は少し時間がかかる場合があります)"):
+                            audio_bytes = audio_file.read()
+                            info = st.session_state.student_info
+                            file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
+                            
+                            audio_url = upload_to_drive_with_retry(audio_bytes, file_name)
+                            student_speech, eval_result, system_status = analyze_and_evaluate_gemini_with_retry(audio_bytes, q_text, q_criteria)
+                            
+                            st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
+                            st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
+                            st.session_state.answers_cache[f"q{idx}_audio_url"] = str(audio_url)
+                            
+                            st.session_state.current_feedback = {"speech": student_speech, "eval": eval_result, "status": system_status}
+                        st.rerun()
+            
+            if st.session_state.current_feedback is not None:
+                st.success("🎯 回答の送信が完了しました！")
+                with st.container(border=True):
+                    st.markdown("#### 🗣️ あなたが話した英語（AIの文字起こし）")
+                    st.code(st.session_state.current_feedback["speech"], language="text")
+                    st.markdown("#### 📝 採点・アドバイス")
+                    st.info(st.session_state.current_feedback["eval"])
+                    st.caption(f"🔧 稼働システム情報: {st.session_state.current_feedback['status']}")
+                
+                if st.button("次の質問へ進む ➡️", type="primary", key=f"next_btn_{idx}"):
+                    st.session_state.current_feedback = None
+                    st.session_state.start_time = None 
+                    st.session_state.timer_done = False  # 次の問題のためにタイマーをリセット
+                    st.session_state.current_q_idx += 1
                     st.rerun()
-        
-        if st.session_state.current_feedback is not None:
-            st.success("🎯 回答の送信が完了しました！")
-            with st.container(border=True):
-                st.markdown("#### 🗣️ あなたが話した英語（AIの文字起こし）")
-                st.code(st.session_state.current_feedback["speech"], language="text")
-                st.markdown("#### 📝 採点・アドバイス")
-                st.info(st.session_state.current_feedback["eval"])
-                st.caption(f"🔧 稼働システム情報: {st.session_state.current_feedback['status']}") # 動作確認用
-            
-            if st.button("次の質問へ進む ➡️", type="primary", key=f"next_btn_{idx}"):
-                st.session_state.current_feedback = None
-                st.session_state.start_time = None 
-                st.session_state.current_q_idx += 1
-                st.rerun()
     else:
         st.balloons()
         st.success("🎉 すべての質問が終了しました！")
         if "data_saved" not in st.session_state:
-            with st.spinner("保存中..."):
-                save_results_to_sheet(st.session_state.student_info, st.session_state.answers_cache, st.session_state.time_records, num_questions)
+            with st.spinner("スプレッドシートへ最終データを保存中... ⏳"):
+                save_results_to_sheet_with_retry(st.session_state.student_info, st.session_state.answers_cache, st.session_state.time_records, num_questions)
             st.session_state.data_saved = True
         if st.button("最初の画面に戻る（次の生徒用）"):
             for key in list(st.session_state.keys()): del st.session_state[key]
