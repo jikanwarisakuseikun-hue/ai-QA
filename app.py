@@ -30,21 +30,37 @@ if "current_feedback" not in st.session_state:
     st.session_state.current_feedback = None
 
 # Gemini APIの初期化
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+try:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+except Exception as e:
+    st.error(f"⚠️ Secretsの「GEMINI_API_KEY」の読み込みに失敗しました: {e}")
 
-GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
+try:
+    GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
+except Exception as e:
+    st.error(f"⚠️ Secretsの「GOOGLE_DRIVE_FOLDER_ID」の読み込みに失敗しました: {e}")
 
 # --- 2. スプレッドシート接続の初期化 ---
 @st.cache_resource
 def get_gspread_client():
-    creds_info = st.secrets["connections"]["gsheets"]
-    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
-    return gspread.authorize(creds)
+    try:
+        creds_info = st.secrets["connections"]["gsheets"]
+        scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+        creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"⚠️ Googleサービスアカウントの認証に失敗しました。Secretsの設定を確認してください: {e}")
+        st.stop()
 
 def get_spreadsheet():
-    gc = get_gspread_client()
-    return gc.open_by_url(st.secrets["spreadsheet"])
+    try:
+        gc = get_gspread_client()
+        # Secrets内のスプレッドシートURLを取得
+        spreadsheet_url = st.secrets["spreadsheet"]
+        return gc.open_by_url(spreadsheet_url)
+    except Exception as e:
+        st.error(f"⚠️ スプレッドシートのオープンに失敗しました。URLまたはアクセス権限（共有設定）を確認してください: {e}")
+        st.stop()
 
 # --- 3. AI & 音声 連携関数 (Gemini一本化仕様) ---
 
@@ -142,13 +158,16 @@ def upload_to_drive(audio_bytes, file_name) -> str:
         return f"Upload Failed: {e}"
 
 # --- 4. スプレッドシート操作関数 ---
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=60)  # テスト時の反映確認を早めるため、キャッシュ保持時間を10分から1分(60秒)に短縮
 def load_all_config():
     try:
         sh = get_spreadsheet()
+        # ⚠️ シート名が「Config」であることを確認
         data = sh.worksheet("Config").get_all_records()
         return pd.DataFrame(data)
-    except:
+    except Exception as e:
+        # 💻 エラー発生時に詳細な原因を画面に出力するように変更
+        st.error(f"⚠️ スプレッドシート「Config」シートのデータ取得に失敗しました。詳細エラー: {e}")
         return pd.DataFrame()
 
 def save_results_to_sheet(student_info: dict, answers: dict, time_records: dict, num_questions: int):
@@ -184,12 +203,20 @@ df_config_all = load_all_config()
 
 if not st.session_state.test_started:
     st.subheader("受験者情報を入力してください")
+    
+    # 読み込んだデータが正しく取得できているか判定
     if not df_config_all.empty and 'School' in df_config_all.columns:
         df_config_all = df_config_all.astype(str)
-        available_schools = sorted(list(df_config_all['School'].dropna().unique()))
-        available_grades = sorted(list(df_config_all['Grade'].dropna().unique()))
-        available_classes = sorted(list(df_config_all['Class'].dropna().unique()))
+        try:
+            available_schools = sorted(list(df_config_all['School'].dropna().unique()))
+            available_grades = sorted(list(df_config_all['Grade'].dropna().unique()))
+            available_classes = sorted(list(df_config_all['Class'].dropna().unique()))
+        except Exception as e:
+            st.error(f"⚠️ 列名（School, Grade, Class）のいずれかがシートに見つかりません。列名ヘッダーのスペルを確認してください。 エラー: {e}")
+            available_schools, available_grades, available_classes = ["〇〇中"], ["1年"], ["1組"]
     else:
+        # データが読めなかった場合の代替（デフォルト値）
+        st.warning("⚠️ スプレッドシートからデータを取得できませんでした。デフォルトの設定（〇〇中 1年 1組）で表示しています。")
         available_schools, available_grades, available_classes = ["〇〇中"], ["1年"], ["1組"]
     
     school = st.selectbox("学校名", available_schools)
@@ -198,14 +225,19 @@ if not st.session_state.test_started:
     attend_num = st.selectbox("出席番号", [i for i in range(1, 51)], index=0)
     name = st.text_input("氏名（例：タロウ / ニックネーム）")
     
+    # 手動でキャッシュをクリアして再読み込みするボタンを配置
+    if st.button("🔄 スプレッドシートからデータを再読込する"):
+        st.cache_data.clear()
+        st.rerun()
+    
     if st.button("テストを始める", type="primary"):
         if name.strip() == "" or df_config_all.empty:
-            st.warning("入力確認またはConfigシートを確認してください。")
+            st.warning("入力内容を確認するか、上記のエラー内容を確認してConfigシートを修正してください。")
         else:
             df_config_all = df_config_all.astype(str)
             student_config = df_config_all[(df_config_all['School'] == str(school)) & (df_config_all['Grade'] == str(grade)) & (df_config_all['Class'] == str(class_num))]
             if student_config.empty:
-                st.error("クラス設定が見つかりません。")
+                st.error("入力されたクラス設定（School, Grade, Classの組み合わせ）がConfigシートに見つかりません。")
             else:
                 st.session_state.student_info = {"school": school, "grade": grade, "class_num": class_num, "attend_num": attend_num, "name": name.strip(), "config": student_config.iloc[0].to_dict()}
                 st.session_state.test_started = True
