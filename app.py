@@ -293,7 +293,7 @@ else:
         if st.session_state.last_timer_q_idx != idx:
             st.markdown("#### 🧠 2. 答える英語を考えてください（シンキングタイム）")
             # 20秒の考える時間（学校現場に合わせた秒数。必要に応じて変更してください）
-            thinking_seconds = 20 
+            thinking_seconds = 10
             
             progress_bar = st.progress(0.0)
             status_text = st.empty()
