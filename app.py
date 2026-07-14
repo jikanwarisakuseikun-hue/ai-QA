@@ -5,7 +5,6 @@ import io
 import time
 import os
 import google.generativeai as genai  # Gemini用
-from groq import Groq                # Groq用
 from gtts import gTTS
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -13,7 +12,7 @@ from google.oauth2 import service_account
 import gspread
 
 # --- 1. ページ基本設定 & セッション状態の初期化 ---
-st.set_page_config(page_title="AI英語QAテスト (二刀流ハイブリッド)", page_icon="🇬🇧", layout="centered")
+st.set_page_config(page_title="AI英語QAテスト", page_icon="🇬🇧", layout="centered")
 
 if "test_started" not in st.session_state:
     st.session_state.test_started = False
@@ -30,8 +29,7 @@ if "time_records" not in st.session_state:
 if "current_feedback" not in st.session_state:
     st.session_state.current_feedback = None
 
-# 両方のAPIを初期化
-groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+# Gemini APIの初期化
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 GOOGLE_DRIVE_FOLDER_ID = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
@@ -48,7 +46,7 @@ def get_spreadsheet():
     gc = get_gspread_client()
     return gc.open_by_url(st.secrets["spreadsheet"])
 
-# --- 3. AI & 音声 連携関数 (ハイブリッド仕様) ---
+# --- 3. AI & 音声 連携関数 (Gemini一本化仕様) ---
 
 def generate_ai_voice(text: str):
     try:
@@ -61,89 +59,70 @@ def generate_ai_voice(text: str):
         st.error(f"AI音声の生成に失敗しました: {e}")
         return None
 
-def analyze_and_evaluate_hybrid(audio_bytes, question_text: str, criteria: str):
-    """【二刀流システム】まずはGroqで試み、ダメなら自動でGeminiに切り替える"""
+def analyze_and_evaluate_gemini(audio_bytes, question_text: str, criteria: str):
+    """【Gemini専用評価システム】音声から文字起こしと評価を同時に実行"""
     
-    # 共通のプロンプト
+    # プロンプトの定義
     prompt_evaluation = f"""
     あなたは中学校の英語教師です。
-    生徒が答えた英文と、提示した質問・評価基準を照らし合わせて、生徒の回答を採点してください。
+    提示した質問・評価基準と、添付された生徒の録音音声（英語）を照らし合わせて、以下の2つのタスクを行ってください。
 
     【先生が提示した質問】: {question_text}
     【先生が提示した評価基準】: {criteria}
+
+    【タスク1: 文字起こし】
+    生徒が何と言っているか、英語で正確に文字起こししてください。無音や英語として聞き取れない場合は 「No speech」 と出力してください。
+
+    【タスク2: 採点・評価】
+    評価基準に沿って、判定（A/B/Cのいずれか）と生徒への優しい日本語アドバイスを作成してください。
+
+    【出力フォーマット】
+    必ず以下のフォーマットを厳守して出力してください。これ以外の挨拶や解説は含めないでください。
+    ■文字起こし:
+    (ここに文字起こしした英文)
+    ■評価結果:
+    判定: (A / B / C のいずれか)
+    アドバイス: (生徒への優しい日本語のアドバイス)
     """
 
-    # --- ルート①: まずは Groq (Whisper + Llama) で実行 ---
-    try:
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = "student_speech.wav"
+    # 音声データをGeminiの仕様に合わせて変換
+    audio_data = {
+        "mime_type": "audio/wav",
+        "data": io.BytesIO(audio_bytes).getvalue()
+    }
 
-        # 文字起こし (Groq Whisper)
-        transcription = groq_client.audio.transcriptions.create(
-            file=audio_file, model="whisper-large-v3", language="en"
-        )
-        student_speech = transcription.text.strip()
-        if not student_speech:
-            student_speech = "[音声が聞き取れませんでした]"
-
-        # 採点 (Groq Llama)
-        prompt_llama = prompt_evaluation + f"\n【生徒の回答】: {student_speech}\n\n【出力フォーマット】\n必ず以下の形式で出力してください。\n\n判定: (A / B / C のいずれか)\nアドバイス: (生徒への優しい日本語のアドバイス)"
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt_llama}],
-            model="llama-3.1-8b-instant",
-            temperature=0.3,
-        )
-        eval_result = chat_completion.choices[0].message.content.strip()
-        
-        return student_speech, eval_result, "🟢 Groq (正常)"
-
-    except Exception as groq_error:
-        # Groqが制限やエラーで落ちた場合、自動でGemini（ルート②）に突入
-        pass
-
-    # --- ルート②: バックアップの Gemini で実行 ---
-    try:
-        # 音声データをGeminiの最新仕様に合わせて安全に型変換
-        audio_data = {
-            "mime_type": "audio/wav",
-            "data": io.BytesIO(audio_bytes).getvalue()
-        }
-
-        prompt_gemini = prompt_evaluation + """
-        \n添付された生徒の録音音声（英語）を聴いて、以下の2つのタスクを行ってください。
-
-        【タスク1: 文字起こし】
-        生徒が何と言っているか、英語で正確に文字起こししてください。
-
-        【タスク2: 採点・評価】
-        判定（A/B/C）と優しい日本語アドバイスを作成してください。
-
-        【出力フォーマット】
-        必ず以下の形式で出力してください。
-        ■文字起こし:
-        (ここに文字起こしした英文)
-        ■評価結果:
-        判定: (A / B / C)
-        アドバイス: (日本語アドバイス)
-        """
-        
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content([audio_data, prompt_gemini])
-        
-        result_text = response.text
-        student_speech_gemini = "[文字起こしの抽出に失敗しました]"
-        eval_result_gemini = result_text
-        
-        if "■文字起こし:" in result_text and "■評価結果:" in result_text:
-            parts = result_text.split("■評価結果:")
-            eval_result_gemini = "■評価結果:" + parts[1]
-            student_speech_gemini = parts[0].replace("■文字起こし:", "").strip()
+    # 環境によってモデル名が拒否されないよう、自動で予備のモデルに切り替える（フォールバック）
+    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
+    
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content([audio_data, prompt_evaluation])
+            result_text = response.text
             
-        return student_speech_gemini, eval_result_gemini, "🟡 Gemini (バックアップ発動)"
-        
-    except Exception as gemini_error:
-        # 両方全滅した場合
-        return f"[エラー] 両方のAIが応答しませんでした。", f"Groqエラー: {groq_error}\nGeminiエラー: {gemini_error}", "🔴 全滅"
+            # 初期値設定
+            student_speech = "[文字起こしの抽出に失敗しました]"
+            eval_result = result_text
+            
+            # フォーマット通りに文字起こしと評価結果を分割
+            if "■文字起こし:" in result_text and "■評価結果:" in result_text:
+                parts = result_text.split("■評価結果:")
+                eval_result = "■評価結果:" + parts[1]
+                student_speech = parts[0].replace("■文字起こし:", "").strip()
+                
+            return student_speech, eval_result, f"🟢 Gemini ({model_name} で解析完了)"
+            
+        except Exception as e:
+            last_error = str(e)
+            continue # 次のモデル名で再試行
+            
+    # 全てのモデルが全滅した場合
+    return (
+        "[エラー] AIが応答しませんでした。", 
+        f"Geminiエラー: {last_error}\nお使いの環境のライブラリバージョンやAPIキーの設定をご確認ください。", 
+        "🔴 解析失敗"
+    )
 
 def upload_to_drive(audio_bytes, file_name) -> str:
     try:
@@ -199,7 +178,7 @@ def save_results_to_sheet(student_info: dict, answers: dict, time_records: dict,
         st.error(f"保存エラー: {e}")
 
 # --- 5. メイン処理 ---
-st.title("🇬🇧 AI English QA Test (Hybrid)")
+st.title("🇬🇧 AI English QA Test")
 
 df_config_all = load_all_config()
 
@@ -273,8 +252,8 @@ else:
                         file_name = f"{info['grade']}{info['class_num']}_{info['attend_num']}番_{info['name']}_Q{idx}.wav"
                         audio_url = upload_to_drive(audio_bytes, file_name)
                         
-                        # ハイブリッド評価関数を実行
-                        student_speech, eval_result, system_status = analyze_and_evaluate_hybrid(audio_bytes, q_text, q_criteria)
+                        # Gemini評価関数を実行
+                        student_speech, eval_result, system_status = analyze_and_evaluate_gemini(audio_bytes, q_text, q_criteria)
                         
                         st.session_state.answers_cache[f"q{idx}_speech"] = str(student_speech)
                         st.session_state.answers_cache[f"q{idx}_eval"] = str(eval_result)
@@ -290,7 +269,7 @@ else:
                 st.code(st.session_state.current_feedback["speech"], language="text")
                 st.markdown("#### 📝 採点・アドバイス")
                 st.info(st.session_state.current_feedback["eval"])
-                st.caption(f"🔧 稼働システム情報: {st.session_state.current_feedback['status']}") # 動作確認用の隠し文字
+                st.caption(f"🔧 稼働システム情報: {st.session_state.current_feedback['status']}") # 動作確認用
             
             if st.button("次の質問へ進む ➡️", type="primary", key=f"next_btn_{idx}"):
                 st.session_state.current_feedback = None
