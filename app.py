@@ -217,7 +217,7 @@ def save_results_to_sheet_with_retry(student_info: dict, answers: dict, time_rec
                 return False
 
 # --- 5. メイン処理 ---
-st.title("🇬🇧 AI English QA Test")
+st.title("🌏 Nexus English")
 
 df_config_all = load_all_config()
 
