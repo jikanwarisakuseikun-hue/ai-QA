@@ -110,7 +110,7 @@ def analyze_and_evaluate_gemini_with_retry(audio_bytes, question_text: str, crit
         "data": io.BytesIO(audio_bytes).getvalue()
     }
 
-    models_to_try = ["gemini-2.5-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash-lite"]
+    models_to_try = ["gemini-2.5-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash-lite"]
     
     for attempt in range(max_retries):
         last_error = ""
