@@ -13,7 +13,7 @@ from google.oauth2 import service_account
 import gspread
 
 # --- 1. ページ基本設定 & セッション状態の初期化 ---
-st.set_page_config(page_title="AI英語QAテスト", page_icon="🇬🇧", layout="centered")
+st.set_page_config(page_title="Nexus English", page_icon="🌐", layout="centered")
 
 if "test_started" not in st.session_state:
     st.session_state.test_started = False
